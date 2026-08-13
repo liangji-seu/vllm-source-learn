@@ -425,10 +425,12 @@ def request_memory(init_snapshot: MemorySnapshot, cache_config: CacheConfig) -> 
 
     计算vllm需要的显存大小，然后评估目前的空闲显存是否足够
     """
+    # ──【显存 profiling】按 gpu_memory_utilization 占比计算 vllm 需要预留的显存大小 ──
     requested_memory = math.ceil(
         init_snapshot.total_memory * cache_config.gpu_memory_utilization # 这个是用户配置的显存使用比例
     )
 
+    # ──【显存 profiling】校验当前空闲显存是否满足预留需求，不足则抛出显存不足错误 ──
     if init_snapshot.free_memory < requested_memory:
         raise ValueError(
             f"Free memory on device {init_snapshot.device_} "

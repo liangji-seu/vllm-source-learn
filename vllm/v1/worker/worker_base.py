@@ -208,9 +208,11 @@ class WorkerWrapperBase:
         All workers have rpc_rank=0, but they have different ranks in the TP
         group.
         """
+        # ──【异步 RPC + TP】rpc_rank 是 worker 在 executor 中的通信 rank，global_rank 是分布式组(TP)中的全局 rank ──
         self.rpc_rank: int = rpc_rank
         self.global_rank: int = self.rpc_rank if global_rank is None else global_rank
 
+        # ──【异步 RPC】worker 与 vllm_config 延迟到 init_worker 才真正初始化，此处仅作类型声明 ──
         # Initialized after init_worker is called
         self.worker: WorkerBase
         self.vllm_config: VllmConfig
@@ -232,6 +234,7 @@ class WorkerWrapperBase:
         Here we inject some common logic before initializing the worker.
         Arguments are passed to the worker class constructor.
         """
+        # ──【异步 RPC】按 rpc_rank 从引擎广播的 all_kwargs 中取出本 worker 的构造参数与 vllm_config ──
         kwargs = all_kwargs[self.rpc_rank]
 
         vllm_config: VllmConfig | None = kwargs.get("vllm_config")
@@ -240,12 +243,14 @@ class WorkerWrapperBase:
         )
         self.vllm_config = vllm_config
 
+        # ──【通用初始化】开启函数调用追踪并加载通用插件，为构造 worker 做准备（与并行策略无关）──
         vllm_config.enable_trace_function_call_for_thread()
 
         from vllm.plugins import load_general_plugins
 
         load_general_plugins()
 
+        # ──【通用初始化】按限定名解析出真正的 Worker 子类（设备特定实现，如 GPU/TPU/CPU）──
         parallel_config = vllm_config.parallel_config
         if isinstance(parallel_config.worker_cls, str):
             worker_class: type[WorkerBase] = resolve_obj_by_qualname( # 解析出真正的Worker子类
@@ -258,6 +263,7 @@ class WorkerWrapperBase:
                 "and pass the qualified name of the class as a string."
             )
 
+        # ──【异步 RPC】动态继承 worker_extension_cls，扩展 collective_rpc 可调用的方法 ──
         if parallel_config.worker_extension_cls:
             worker_extension_cls = resolve_obj_by_qualname(
                 parallel_config.worker_extension_cls
@@ -286,12 +292,14 @@ class WorkerWrapperBase:
                     extended_calls,
                 )
 
+        # ──【进程管理】取出分配给本 worker 的物理 GPU 编号并覆盖进 parallel_config（多副本/容器绑定显存用）──
         assigned_physical_gpu_ids = kwargs.pop("assigned_physical_gpu_ids", None)
         if assigned_physical_gpu_ids is not None:
             vllm_config.parallel_config.assigned_physical_gpu_ids = (
                 assigned_physical_gpu_ids
             )
 
+        # ──【进程管理】取共享内存锁，为多模态处理器 shm 缓存建立跨进程接收缓存 ──
         shared_worker_lock = kwargs.pop("shared_worker_lock", None)
         if shared_worker_lock is None:
             msg = (
@@ -314,6 +322,7 @@ class WorkerWrapperBase:
                 )
             )
 
+        # ──【异步 RPC】在当前进程注入 vllm_config 后实例化真正的 Worker 子类，完成延迟初始化 ──
         with set_current_vllm_config(self.vllm_config):
             # To make vLLM config available during worker initialization
             self.worker = worker_class(**kwargs) # 在这里构建的Worker子类的实例
@@ -331,6 +340,7 @@ class WorkerWrapperBase:
             self.worker.init_device()  # type: ignore
 
     def __getattr__(self, attr: str):
+        # ──【异步 RPC】把本 wrapper 未定义的属性透明转发给真正的 Worker 实现，实现 RPC 方法的动态代理 ──
         return getattr(self.worker, attr)
 
     def _apply_mm_cache(self, scheduler_output: SchedulerOutput) -> None:

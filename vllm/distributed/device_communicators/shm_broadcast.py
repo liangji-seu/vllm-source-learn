@@ -429,6 +429,7 @@ def _reduce_tensor(tensor: torch.Tensor):
     tensors (e.g. `prompt_embeds` in `SchedulerOutput`) traverse the queue
     without being copied into and back out of the pickled message.
     """
+    # ──【异步 RPC】零拷贝快速路径：CPU 连续张量暴露 uint8 视图给 PickleBuffer，免去 pickle 拷贝 ──
     if (
         tensor.device.type == "cpu"
         and tensor.layout == torch.strided
@@ -447,6 +448,7 @@ def _reduce_tensor(tensor: torch.Tensor):
             dtype_str = str(tensor.dtype).removeprefix("torch.")
             return _rebuild_tensor, (PickleBuffer(raw), tuple(tensor.shape), dtype_str)
 
+    # ──【异步 RPC】兜底路径：交给 torch 默认的拷贝式序列化 ──
     # Fall back to torch's default (copying) reduction.
     return tensor.__reduce_ex__(pickle.HIGHEST_PROTOCOL)
 

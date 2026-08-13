@@ -102,12 +102,14 @@ class AsyncIntermediateTensors(IntermediateTensors):
         comm_handles: list[Handle] | None = None,
         comm_postprocess: list[Callable[[], None]] | None = None,
     ) -> None:
+        # ──【PP + 异步 RPC】暂存上游传来的中间张量与未完成的通信句柄，先不触发同步 ──
         super().__init__(tensors)
         self._comm_handles = comm_handles
         self._comm_postprocess = comm_postprocess
         self._comm_waited = False
 
     def wait_for_comm(self) -> None:
+        # ──【PP + 异步 RPC】惰性同步：等 recv/all-gather 句柄完成并跑后处理，把通信重叠进计算 ──
         if self._comm_waited:
             return
         if self._comm_handles:
@@ -119,6 +121,7 @@ class AsyncIntermediateTensors(IntermediateTensors):
         self._comm_waited = True
 
     def __getattribute__(self, name: str):
+        # ──【PP】访问 .tensors 前强制等待通信完成，保证下游拿到已就绪的中间张量 ──
         # ensure `.tensors` is ready before use
         if name == "tensors" and not object.__getattribute__(self, "_comm_waited"):
             object.__getattribute__(self, "wait_for_comm")()
@@ -135,6 +138,7 @@ class Worker(WorkerBase):
         distributed_init_method: str,
         is_driver_worker: bool = False,
     ):
+        # ──【进程管理】先走父类 WorkerBase 构造，把 rank/local_rank/init_method 等分布式身份保存好 ──
         super().__init__(
             vllm_config=vllm_config,
             local_rank=local_rank,
@@ -143,20 +147,25 @@ class Worker(WorkerBase):
             is_driver_worker=is_driver_worker,
         )
 
+        # ──【CUDA Graph】按环境变量设定 float32 matmul 精度，影响图捕获/回放时算子精度 ──
         # configure float32 matmul precision according to vLLM env.
         precision = envs.VLLM_FLOAT32_MATMUL_PRECISION
         torch.set_float32_matmul_precision(precision)
 
+        # ──【EP/EPLB】创建弹性 EP 执行器，用于运行时动态扩缩专家并行规模 ──
         from vllm.distributed.elastic_ep.elastic_execute import ElasticEPScalingExecutor
 
         self.elastic_ep_executor = ElasticEPScalingExecutor(self)
+        # ──【进程管理】容错模式下挂一个哨兵，接收外部控制命令（如离线/热切换）──
         self.worker_sentinel: WorkerSentinel | None = None
         if self.parallel_config.enable_fault_tolerance:
             self.worker_sentinel = WorkerSentinel(worker=self)
+        # ──【显存 profiling】睡眠/唤醒时把权重与 draft 权重缓冲区卸载到 CPU 再恢复，用于省显存 ──
         # Buffers saved before sleep
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self._sleep_saved_draft_buffers: dict[str, torch.Tensor] = {}
 
+        # ──【异步 RPC】权重传输引擎延迟到 load_model 再建（需模型引用），用于训练侧热更新权重 ──
         # Weight transfer engine is created in `load_model` once the model
         # is available, since the engine needs a reference to the model.
         self.weight_transfer_engine: WeightTransferEngine | None = None
@@ -175,9 +184,11 @@ class Worker(WorkerBase):
 
         # 创建GPUModelRunner
         self.use_v2_model_runner = vllm_config.use_v2_model_runner # 使用v2的modelrunner
+        # ──【PP + 异步 RPC】记录上一轮未完成的非阻塞 PP send 句柄，下轮执行前先等它完成 ──
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
 
+        # ──【显存 profiling】睡眠模式后端懒加载，首次 sleep/wake 时才解析并缓存进程级状态 ──
         # Resolved lazily on first sleep/wake; persists worker-process state.
         self._sleep_mode_backend: SleepModeBackend | None = None
 
@@ -309,9 +320,11 @@ class Worker(WorkerBase):
         #   初始化设备 + 分布式上下文(DP/TP/PP/EP 通信组) + 构造 model_runner(内含 InputBatch)
         # 如果我们指定是用GPU来运行模型
         if self.device_config.device_type == "cuda":
+            # ──【CUDA Graph】Ray 注入的这个环境变量会干扰 CUDA graph 构建，先移除 ──
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
             parallel_config = self.parallel_config # 获取我们的并行化配置，TP，PP，PCP，EP,DP 的相关参数
+            # ──【DP】非 Ray 后端且单机 DP 时，把本进程 local_rank 平移到对应 DP 副本的 GPU 区间 ──
             if (
                 parallel_config.distributed_executor_backend
                 not in ("ray", "external_launcher")
@@ -323,6 +336,7 @@ class Worker(WorkerBase):
                 if dp_local_rank is None:
                     dp_local_rank = self.parallel_config.data_parallel_index
 
+                # ──【TP + PP】每个 DP 副本占用 tp_size×pp_size 张卡，据此平移 local_rank ──
                 # 按照配置计算所需GPU个数
                 tp_pp_world_size = (
                     self.parallel_config.pipeline_parallel_size
@@ -332,6 +346,7 @@ class Worker(WorkerBase):
                 # DP_LOCAL_RANK * TP_PP_WORLD_SIZE + TP_LOCAL_RANK
                 self.local_rank += dp_local_rank * tp_pp_world_size
 
+            # ──【NCCL 通信】发布「逻辑卡→物理卡」映射，供 NIC 亲和 / P2P 拓扑查询使用 ──
             # Publish the logical-to-physical mapping for topology queries
             # such as NIC affinity and P2P checks.
             # assigned_physical_gpu_ids 是一张「逻辑 id → 物理卡」的映射表, 是本机节点运行用的物理GPU列表，按照下标和local_rank对应
@@ -371,6 +386,7 @@ class Worker(WorkerBase):
                 )
 
 
+            # ──【进程管理】把逻辑 local_rank 换算成真正写给 PyTorch 的物理卡号，并设为本进程当前设备 ──
             # visible_device_index 是「最终真正写给 PyTorch 的物理卡号」，作用就一个：决定 self.device 到底是哪张卡，并让 torch 把这张卡设成当前设备
             visible_device_index = (
                 current_platform.logical_device_id_to_visible_device_id(self.local_rank)
@@ -398,6 +414,7 @@ class Worker(WorkerBase):
             # memory snapshot
             # This ensures NCCL buffers are allocated before we measure
             # available memory
+            # ──【NCCL 通信】先初始化分布式环境确保 NCCL 缓冲已分配，再切分 TP/PP/CP 子组 ──
             # 拉起NCCL通信网络，这是一个包装器，做点切分TP/PP/CP分组这些
             init_worker_distributed_environment(
                 self.vllm_config,
@@ -414,11 +431,13 @@ class Worker(WorkerBase):
             if self.use_v2_model_runner:
                 logger.info_once("Using V2 Model Runner")
 
+            # ──【进程管理】统一设置 Python/numpy/torch/CUDA 随机种子，保证整条推理链确定性 ──
             # Set random seed.
             # 设置随机种子，因为 vLLM 的代码里会用到好几套随机数来源（Python 的 random、numpy、torch、以及 GPU 上的 CUDA 随机），
             # 所以要把它们全部设成同一个 seed，才能保证「整条推理链是确定性的」
             set_random_seed(self.model_config.seed)
 
+            # ──【显存 profiling】清掉 Python 垃圾与 PyTorch 缓存后，拍一张初始显存快照作为后续预算基线 ──
             # Now take memory snapshot after NCCL is initialized
                     # 清理python层面的垃圾内存
             gc.collect()
@@ -428,6 +447,7 @@ class Worker(WorkerBase):
 
             # take current memory snapshot
             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device) # 测量还有多少显存
+            # ──【显存 profiling】按 gpu_memory_utilization 算出「打算用多少显存」的预算目标值 ──
             # 这个就是用户设置显存使用比例的地方
             self.requested_memory = request_memory(init_snapshot, self.cache_config)# 计算显存预算，总显存 × 利用率，算出一个「我打算用多少显存」的目标值（预算）
             logger.debug("worker init memory snapshot: %r", self.init_snapshot)
@@ -435,10 +455,12 @@ class Worker(WorkerBase):
                 "worker requested memory: %sGiB", format_gib(self.requested_memory)
             )
 
+        # ──【进程管理】非 GPU 设备直接报错（GPU worker 只支持 CUDA 类设备）──
         # 不是GPU，直接报错
         else:
             raise RuntimeError(f"Unsupported device type: {self.device_config.device}")
 
+        # ──【进程管理】初始化 workspace 草稿纸缓冲池，给自定义 CUDA kernel 存放中间临时变量 ──
         # Initialize workspace manager
         '''
         这是工作区（workspace）缓冲区的管理器初始化——就是给各种自定义 CUDA kernel 准备「草稿纸」用的临时显存池
@@ -457,6 +479,7 @@ class Worker(WorkerBase):
 
 
 
+        # ──核心逻辑：构造 model_runner（V1/V2 两种实现），后续前向/采样都委托给它 ──
         # Construct the model runner
         # Worker 已经准备好了环境，开始第二步，构造model_runner，开始准备着手处理模型了 ！！！！
         if self.use_v2_model_runner:
@@ -495,28 +518,27 @@ class Worker(WorkerBase):
 
         核心就一句 self.model_runner.load_model(...)，外面包了三层 with 上下文管理器做「加载环境准备」，后面再补一段 weight transfer（多机权重搬运）的可选逻辑
         '''
+        # ──【显存 profiling】三层环境准备后加载权重：CuMem 内存池 + thread-local 配置 + 降低分配器碎片 ──
         with (
             self._maybe_get_memory_pool_context(tag="weights"), # 内存池,仅CuMem分配器，普通cuda用户为空
 
-                '''
-                把 vllm_config 设成「当前线程的 config」（thread-local 上下文）。
-                因为 load_model 内部很深的地方（比如各 model 的 load_weights 实现）可能通过 get_current_vllm_config() 来取配置，这层保证取得到
-                '''
+            # 把 vllm_config 设成「当前线程的 config」（thread-local 上下文）。
+            # 因为 load_model 内部很深的地方（比如各 model 的 load_weights 实现）
+            # 可能通过 get_current_vllm_config() 来取配置，这层保证取得到
             set_current_vllm_config(self.vllm_config),          # 把config设置成当前的config
 
 
-            '''
-                这是三者里唯一「对普通用户也真的做点事」的。它临时把 PyTorch CUDA 分配器的 max_split_size_mb 调成 20 MiB：
-
-                为什么：加载权重时会申请很多大块、大小不一的显存，默认分配器容易产生碎片（内存碎成小块浪费掉）
-                调成 20MiB = 让分配器更细地切分，减少碎片，代价是多几次 cudaMalloc（权重加载是一次性的，无所谓）
-                退出 with 后 finally 里恢复原值（302-304 行）
-            '''
+            # 这是三者里唯一「对普通用户也真的做点事」的。它临时把 PyTorch CUDA 分配器的
+            # max_split_size_mb 调成 20 MiB：
+            # 为什么：加载权重时会申请很多大块、大小不一的显存，默认分配器容易产生碎片（内存碎成小块浪费掉）
+            # 调成 20MiB = 让分配器更细地切分，减少碎片，代价是多几次 cudaMalloc（权重加载是一次性的，无所谓）
+            # 退出 with 后 finally 里恢复原值（302-304 行）
             # 20 MiB is the minimum PyTorch allows for max_split_size_mb.
             self._scoped_allocator_max_split(max_split_size_mb=20),# ③ 临时调 allocator 参数
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights) # 真正加载权重
 
+        # ──【异步 RPC】可选的多机权重传输：为跨机热更新/加载权重建立传输引擎 ──
         # 多机权重转移的逻辑
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
@@ -555,8 +577,10 @@ class Worker(WorkerBase):
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
+        # ──【显存 profiling】应用上次启动保存的启动计划（复用上轮的 KV cache 大小决策）──
         maybe_apply_startup_plan(self)
 
+        # ──【显存 profiling】用户手动指定 kv_cache_memory_bytes：跳过自动测量，直接按该值预留 ──
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
@@ -581,6 +605,7 @@ class Worker(WorkerBase):
                 getattr(self.parallel_config, "_api_process_count", 1),
             )
 
+        # ──【显存 profiling】用假输入跑一次前向，实测模型权重+激活峰值，作为 KV cache 预算的依据 ──
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
         with memory_profiling(
@@ -595,6 +620,7 @@ class Worker(WorkerBase):
         # the AMD-CI mem tests), and graph_pool_handle resolves to the same
         # torch.cuda handle the live capture path already uses on ROCm.
         # XPU stays excluded (see #39977).
+        # ──【CUDA Graph】若要捕获 CUDA graph，再单独估出图池（graph pool）占用的显存 ──
         cudagraph_memory_estimate = 0
         if (
             current_platform.is_cuda_alike()
@@ -627,6 +653,7 @@ class Worker(WorkerBase):
             "To fix this, ensure consistent GPU memory allocation or "
             "isolate vLLM in its own container."
         )
+        # ──【显存 profiling】可给 KV cache 的显存 = 预算 - 非 KV 占用 - CUDA graph 池估算 ──
         self.available_kv_cache_memory_bytes = (
             self.requested_memory
             - profile_result.non_kv_cache_memory
@@ -690,6 +717,7 @@ class Worker(WorkerBase):
                     suggested_util,
                 )
 
+        # ──【显存 profiling】扣除多模态输入所需的 IPC 共享显存后，返回最终可用 KV cache 字节数 ──
         return reserve_mm_ipc_gpu_memory(
             int(self.available_kv_cache_memory_bytes),
             self.model_config.multimodal_config,
@@ -736,10 +764,12 @@ class Worker(WorkerBase):
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
 
+        # ──【显存 profiling】用 profiling 后调整好的块数回填本地配置，供 warmup 阶段使用 ──
         # Update local config with adjusted num blocks after profiling,
         # so that it's available to the warmup stage.
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
 
+        # ──【PD 分离】初始化 KV connector，让 prefill/decode 实例之间能跨机搬运 KV cache ──
         # Init kv cache connector here, because it requires
         # `kv_cache_config`.
         # NOTE(Kuntai): This need to be done before `initialize_kv_cache`,
@@ -747,12 +777,15 @@ class Worker(WorkerBase):
         # related to kv cache connector (e.g. kv cache sharing layers).
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
 
+        # ──【显存 profiling】在 KV cache 内存池上下文中真正分配 KV cache 张量 ──
         with self._maybe_get_memory_pool_context(tag="kv_cache"):
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
+        # ──【EP/EPLB】开启返回路由专家时，初始化专家捕获器（用于弹性 EP 动态扩缩容）──
         if self.model_config.enable_return_routed_experts:
             self.model_runner.init_routed_experts_capturer()
 
+        # ──【显存 profiling】在 CuMem 池外构建 KV 置零元数据，避免记账张量在睡眠/唤醒时被丢弃 ──
         # Build KV-zero metadata outside the CuMem pool so the bookkeeping
         # GPU tensors (seg_addrs, block-id buffers) use the standard PyTorch
         # allocator and are not discarded during sleep/wake cycles.
@@ -1102,6 +1135,7 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        # ──【结构化输出/grammar】采样委托给 model_runner，grammar bitmask 在此约束 token 选择 ──
         return self.model_runner.sample_tokens(grammar_output)
 
     @torch.inference_mode()
@@ -1109,6 +1143,7 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        # ──【PP + 异步 RPC】等上一轮非阻塞 PP send 完成，避免与新迭代的通信重叠冲突 ──
         # ensure any previous non-blocking PP sends are complete
         if self._pp_send_work:
             for handle in self._pp_send_work:
@@ -1122,6 +1157,7 @@ class Worker(WorkerBase):
         compilation_config = self.vllm_config.compilation_config
         parallel_config = self.vllm_config.parallel_config
 
+        # ──【PP + TP】PP>1 且开启序列并行(SP)时，预先算出残差是否需要 all-gather ──
         if (
             parallel_config.pipeline_parallel_size > 1
             and compilation_config.pass_config.enable_sp
@@ -1151,6 +1187,7 @@ class Worker(WorkerBase):
                 )
             }
 
+        # ──【PP + 异步 RPC】非首个 PP 阶段：从上游非阻塞接收中间张量，包装成惰性同步对象 ──
         if forward_pass and not get_pp_group().is_first_rank:
             tensor_dict, comm_handles, comm_postprocess = (
                 get_pp_group().irecv_tensor_dict(
@@ -1165,6 +1202,7 @@ class Worker(WorkerBase):
                 comm_postprocess=comm_postprocess,
             )
 
+        # ──【CUDA Graph】带 profiling 注解调用 model_runner 前向（内部含 CUDA graph 回放 / eager 两种路径）──
         with self.annotate_profile(scheduler_output):
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
@@ -1187,6 +1225,7 @@ class Worker(WorkerBase):
             and not get_pp_group().is_last_rank
         )
 
+        # ──【PP + 异步 RPC】非末级 PP 阶段：非阻塞把中间张量发给下游，句柄留待下轮等待 ──
         # launch non-blocking send of intermediate tensors
         self._pp_send_work = get_pp_group().isend_tensor_dict(
             output.tensors,
@@ -1469,13 +1508,16 @@ def init_worker_distributed_environment(
     
     """
     parallel_config = vllm_config.parallel_config
+    # ──【CUDA Graph】初始化 batch-invariant 机制：让捕获的图能对不同 batch 重放 ──
     from vllm.model_executor.layers.batch_invariant import init_batch_invariance
 
     init_batch_invariance()
+    # ──【EP/EPLB】按 MoE backend 覆写 EPLB 负载均衡相关环境变量 ──
     override_envs_for_eplb(
         parallel_config,
         moe_backend=getattr(vllm_config.kernel_config, "moe_backend", None),
     )
+    # ──【TP】决定是否用 vLLM 自研 all-reduce kernel 替代 NCCL 原生（省通信开销）──
     set_custom_all_reduce(not parallel_config.disable_custom_all_reduce)
 
     init_method = distributed_init_method or "env://"
@@ -1484,6 +1526,7 @@ def init_worker_distributed_environment(
     if parallel_config.distributed_timeout_seconds is not None:
         timeout = timedelta(seconds=parallel_config.distributed_timeout_seconds)
 
+    # ──【NCCL 通信】真正调 torch.distributed.init_process_group 拉起 NCCL 通信网（核心建群）──
     # 构造卡的通信网络
     init_distributed_environment(
         parallel_config.world_size, # 并行配置
@@ -1494,6 +1537,7 @@ def init_worker_distributed_environment(
         timeout,
     )
 
+    # ──【TP + PP】在 world group 之上再切 TP/PP/CP 子通信组，供各层算子按需 all-reduce ──
     ensure_model_parallel_initialized(
         parallel_config.tensor_parallel_size,
         parallel_config.pipeline_parallel_size,
@@ -1501,6 +1545,7 @@ def init_worker_distributed_environment(
         parallel_config.decode_context_parallel_size,
     )
 
+    # ──【PD 分离】在 KV cache 初始化前先建 encoder 传输连接（EPD 分离模式下 encoder 实例不建 KV）──
     # Init ec connector here before KV caches init
     # NOTE: We do not init KV caches for Encoder-only instance in EPD disagg mode
     ensure_ec_transfer_initialized(vllm_config)

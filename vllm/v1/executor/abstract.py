@@ -80,10 +80,12 @@ class Executor(ABC):
     # 这是一个静态的工厂方法
     @staticmethod
     def get_class(vllm_config: VllmConfig) -> type["Executor"]:
+        # ──【进程管理】从并行配置读取执行器后端，决定用哪种进程/编排模型 ──
         executor_class: type[Executor]
         parallel_config = vllm_config.parallel_config
         distributed_executor_backend = parallel_config.distributed_executor_backend
         # distributed_executor_backend must be set in VllmConfig.__post_init__
+        # ──【进程管理】直接传入 Executor 子类类型：显式指定执行器实现 ──
         if isinstance(distributed_executor_backend, type):
             if not issubclass(distributed_executor_backend, Executor):
                 raise TypeError(
@@ -91,6 +93,7 @@ class Executor(ABC):
                     f"Executor. Got {distributed_executor_backend}."
                 )
             executor_class = distributed_executor_backend
+        # ──【进程管理】Ray 后端：多机多卡由 Ray 编排 Worker 进程 ──
         elif distributed_executor_backend == "ray":
             if envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:
                 from vllm.v1.executor.ray_executor_v2 import RayExecutorV2
@@ -100,19 +103,23 @@ class Executor(ABC):
                 from vllm.v1.executor.ray_executor import RayDistributedExecutor
 
                 executor_class = RayDistributedExecutor # 多机多卡的执行器类
+        # ──【进程管理 + 异步 RPC】单机多卡：每卡一个 Worker 进程，MessageQueue 通信 ──
         elif distributed_executor_backend == "mp":
             from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 
             executor_class = MultiprocExecutor # 单机多卡的执行器类，负责：创建管理多个worker, collective_rpc广播通信
+        # ──【进程管理】单机单卡：无多进程、无 IPC，直接调用 Worker ──
         elif distributed_executor_backend == "uni":
             from vllm.v1.executor.uniproc_executor import UniProcExecutor
 
             executor_class = UniProcExecutor # 单机单卡的执行器类，无需多进程，无需IPC，最简单
+        # ──【进程管理】外部启动器：由 torchrun/Slurm 等提前拉起 Worker，vLLM 只负责连接 ──
         elif distributed_executor_backend == "external_launcher":
             # TODO: make v1 scheduling deterministic
             # to support external launcher                # ray是自己管理，ray负责创建worker,跨节点管理
                                                           # external_launcher是 torchrun， 这个是用来连接已经存在的worker的，由外部系统创建好worker了
             executor_class = ExecutorWithExternalLauncher # vLLM 不负责启动 Worker 进程，而是交给外部启动器（例如 torchrun、Slurm）提前启动好
+        # ──【进程管理】按字符串路径动态解析自定义执行器类（如插件扩展）──
         elif isinstance(distributed_executor_backend, str):
             executor_class = resolve_obj_by_qualname(distributed_executor_backend)
             if not issubclass(executor_class, Executor):
@@ -131,6 +138,7 @@ class Executor(ABC):
         self,
         vllm_config: VllmConfig,
     ) -> None:
+        # ── 解包总配置：拆出模型/缓存/并行(TP/PP/DP)/投机/LoRA 等子配置供后续取用 ──
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -141,13 +149,17 @@ class Executor(ABC):
         self.device_config = vllm_config.device_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+        # ──【进程管理】交由子类创建/启动 Worker 进程与通信通道 ──
         self._init_executor()
+        # ── sleep 状态位：记录是否休眠及已卸载模块（权重/KV cache）──
         self.is_sleeping = False
         self.sleeping_tags: set[str] = set()
+        # ──【PD 分离】KV connector 输出聚合器：汇总 prefill/decode 分离传输的 KV ──
         self.kv_output_aggregator: KVOutputAggregator | None = None
 
     @abstractmethod
     def _init_executor(self) -> None:
+        # ──【进程管理】抽象方法：由子类创建 Worker 进程并建立 RPC 通信通道 ──
         raise NotImplementedError
 
     def initialize_from_config(self, kv_cache_configs: list[KVCacheConfig]) -> None:
@@ -182,8 +194,10 @@ class Executor(ABC):
         return self.collective_rpc("determine_available_memory")
 
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
+        # ──【异步 RPC + 显存 profiling】广播到各 Worker 获取 KV cache 规格，用于显存规划 ──
         return self.collective_rpc("get_kv_cache_spec")
 
+    # ──【异步 RPC】重载签名 1：non_block=False，阻塞等待所有 Worker 返回结果 ──
     @overload
     def collective_rpc(
         self,
@@ -219,6 +233,7 @@ class Executor(ABC):
         """
         pass
 
+    # ──【异步 RPC】重载签名 2：non_block=True，返回 Future 列表，异步不等待 ──
     @overload
     def collective_rpc(
         self,
@@ -230,6 +245,7 @@ class Executor(ABC):
     ) -> Future[list[_R]]:
         pass
 
+    # ──【异步 RPC + 进程管理】抽象实现：子类按各自通信机制把调用广播到所有 Worker ──
     @abstractmethod
     def collective_rpc(
         self, method, timeout=None, args=(), kwargs=None, non_block: bool = False
@@ -241,19 +257,22 @@ class Executor(ABC):
     ) -> list[dict[tuple[int, int], KVConnectorHandshakeMetadata]]:
         return self.collective_rpc("get_kv_connector_handshake_metadata")
 
+    # ──【异步 RPC】重载签名：non_block=False，阻塞式执行模型 forward ──
     @overload
     def execute_model(
         self, scheduler_output: SchedulerOutput, non_block: Literal[False] = False
     ) -> ModelRunnerOutput | None:
         pass
 
+    # ──【异步 RPC】重载签名：non_block=True，异步执行并返回 Future ──
     @overload
     def execute_model(
         self, scheduler_output: SchedulerOutput, non_block: Literal[True] = True
     ) -> Future[ModelRunnerOutput | None]:
         pass
 
-    def `execute_model`(
+    # ──【异步 RPC】把调度输出广播到所有 Worker 执行模型 forward，返回首个 Worker 结果 ──
+    def execute_model(
         self, scheduler_output: SchedulerOutput, non_block: bool = False
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
         output = self.collective_rpc(  # type: ignore[call-overload]
@@ -261,18 +280,21 @@ class Executor(ABC):
         )
         return output[0]
 
+    # ──【异步 RPC + 结构化输出/grammar】重载签名：阻塞式采样 token（应用 grammar 约束）──
     @overload
     def sample_tokens(
         self, grammar_output: GrammarOutput | None, non_block: Literal[False] = False
     ) -> ModelRunnerOutput:
         pass
 
+    # ──【异步 RPC + 结构化输出/grammar】重载签名：non_block=True 异步采样，返回 Future ──
     @overload
     def sample_tokens(
         self, grammar_output: GrammarOutput | None, non_block: Literal[True] = True
     ) -> Future[ModelRunnerOutput]:
         pass
 
+    # ──【异步 RPC + 结构化输出/grammar】把 grammar 约束广播到所有 Worker 采样 token，返回首个结果 ──
     def sample_tokens(
         self, grammar_output: GrammarOutput | None, non_block: bool = False
     ) -> ModelRunnerOutput | Future[ModelRunnerOutput]:

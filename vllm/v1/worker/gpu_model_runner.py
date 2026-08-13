@@ -5310,10 +5310,12 @@ class GPUModelRunner(
             scope="global",
         )
 
+        # ──【EP/EPLB】初始化专家并行负载均衡状态，用于 MoE 模型的专家路由与负载统计 ──
         if self.parallel_config.enable_eplb:
             self.eplb_state = EplbState(self.parallel_config, self.device)
             eplb_models = 0
 
+        # ──【显存 profiling + TP/PP】在显存分析器内加载主模型权重（由 loader 按 TP/PP 切分并放置到各设备）──
         try:
             with DeviceMemoryProfiler() as m: # 设备内存实际测试器
                 time_before_load = time.perf_counter()
@@ -5323,16 +5325,19 @@ class GPUModelRunner(
                 self.model = model_loader.load_model( # 加载模型
                     vllm_config=self.vllm_config, model_config=self.model_config
                 )
+                # ──【LoRA】加载 LoRA 低秩适配器并合并到主模型 ──
                 if self.lora_config:
                     self.model = self.load_lora_model( # 加载lora微调模型
                         self.model, self.vllm_config, self.device
                     )
 
                 
+                # ──【投机解码】加载草稿模型（draft model），供投机采样生成候选 token ──
                 if hasattr(self, "drafter"):
                     logger.info_once("Loading drafter model...")
                     if hasattr(self.drafter, "load_model"):
                         self.drafter.load_model(self.model) # 加载草稿模型
+                    # ──【投机解码 + EP/EPLB】草稿模型若为 MoE，同样纳入专家负载均衡管理 ──
                     if (
                         hasattr(self.drafter, "model")
                         and is_mixture_of_experts(self.drafter.model)
@@ -5360,8 +5365,10 @@ class GPUModelRunner(
                         self.drafter.set_eplb_state(self.eplb_state)
                         eplb_models += 1
 
+                # ──【投机解码】配置 EAGLE3 辅助隐藏层输出，供草稿模型复用主模型隐藏态 ──
                 self._setup_eagle3_aux_hidden_state_outputs()
 
+                # ──【EP/EPLB】解析 MoE 模型（解包 VLM 包装层），并将主模型加入专家负载均衡 ──
                 # Resolve the MoE model, unwrapping VLM wrappers if needed.
                 # VLM models (e.g. KimiK25ForConditionalGeneration) wrap the
                 # actual MoE language model but don't implement
@@ -5390,8 +5397,10 @@ class GPUModelRunner(
                     )
                     eplb_models += 1
 
+                # ──【显存 profiling】记录加载结束时间与模型实际显存占用 ──
                 time_after_load = time.perf_counter()
             self.model_memory_usage = m.consumed_memory
+        # ──【显存 profiling】显存不足时给出降低显存占用的友好提示并重新抛出 ──
         except torch.cuda.OutOfMemoryError as e:
             msg = (
                 "Failed to load model - not enough GPU memory. "
@@ -5405,6 +5414,7 @@ class GPUModelRunner(
             raise e
 
         
+        # ──【显存 profiling】打印模型加载耗时与显存占用日志 ──
         logger.info_once(
             "Model loading took %s GiB memory and %.6f seconds",
             format_gib(self.model_memory_usage),
@@ -5422,6 +5432,7 @@ class GPUModelRunner(
             self.get_model(), "requires_sequential_video_encoding"
         )  # Temporary hack for dynamic res video w/o support for bs>1 yet
 
+        # ──【EP/EPLB】异步 EPLB 模式下启动后台负载均衡循环 ──
         if (
             self._moe_model is not None
             and self.parallel_config.enable_eplb
@@ -5431,6 +5442,7 @@ class GPUModelRunner(
         ):
             self.eplb_state.start_async_loop()
 
+        # ──【CUDA Graph】stock torch.compile 模式：整图编译后直接返回，不再走后续 CUDA Graph 包装 ──
         if (
             self.vllm_config.compilation_config.mode
             == CompilationMode.STOCK_TORCH_COMPILE
@@ -5447,6 +5459,7 @@ class GPUModelRunner(
         # for other compilation modes, cudagraph behavior is controlled by
         # CudagraphWrapper and CudagraphDispatcher of vllm.
 
+        # ──【CUDA Graph】按 cudagraph 模式为模型选择包装器：breakable / full / ubatching ──
         # wrap the model with full cudagraph wrapper if needed.
         # 包装一层cudagraph模式
         cudagraph_mode = self.compilation_config.cudagraph_mode
@@ -5479,6 +5492,7 @@ class GPUModelRunner(
                     self.model, self.vllm_config, CUDAGraphMode.NONE, self.device
                 )
 
+        # ──【显存 profiling】初始化卸载器，管理受限显存下的权重/KV 卸载 ──
         get_offloader().post_init()
 
 

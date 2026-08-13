@@ -1599,6 +1599,7 @@ def init_distributed_environment(
         init_process_group 只是「建群、登记名册、握手」。
         真正的 NCCL communicator（GPU 之间那条物理通信链路）是在第一次发生 collective 通信（比如第一次 all-reduce）时才 lazy 创建的。
     '''
+    # ──【EP/EPLB】打印初始化参数并读取配置，先判断是否启用弹性 EP（影响后续建组方式）──
     logger.debug(
         "world_size=%d rank=%d local_rank=%d distributed_init_method=%s backend=%s",
         world_size,
@@ -1611,6 +1612,7 @@ def init_distributed_environment(
 
     config = get_current_vllm_config_or_none()
     enable_elastic_ep = config is not None and config.parallel_config.enable_elastic_ep
+    # ──【DP】多节点或跨 DP 副本时，按数据并行维度重排 rank/world_size，使各副本进入同一全局组 ──
     if (
         config is not None
         and config.parallel_config.distributed_executor_backend != "external_launcher"
@@ -1628,6 +1630,7 @@ def init_distributed_environment(
         world_size = parallel_config.world_size_across_dp
 
         # Use appropriate IP and port based on configuration
+        # ──【DP】多节点走 master 地址；单节点多 DP 副本各用独立端口做 rendezvous ──
         if parallel_config.nnodes > 1:
             ip = parallel_config.master_addr
             port = parallel_config.master_port
@@ -1642,6 +1645,7 @@ def init_distributed_environment(
                 rank,
                 distributed_init_method,
             )
+    # ──【NCCL 通信】进程组尚未初始化时，进入建组流程（先校验 init_method 与 backend）──
     if not torch.distributed.is_initialized():
         logger.info(
             "world_size=%d rank=%d local_rank=%d distributed_init_method=%s backend=%s",
@@ -1655,6 +1659,7 @@ def init_distributed_environment(
             "distributed_init_method must be provided when initializing "
             "distributed environment"
         )
+        # ──【NCCL 通信】请求的 backend 不可用时回退到 gloo，保证分布式初始化不失败 ──
         if not torch.distributed.is_backend_available(backend):
             logger.warning(
                 "Distributed backend %s is not available; falling back to gloo.",
@@ -1665,6 +1670,7 @@ def init_distributed_environment(
             )
             backend = "gloo"
         if envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP:
+            # ──【进程管理】split_group 需提前拿到 local_rank 以计算 device_id（eager 初始化）──
             # split_group needs local_rank early to compute device_id for
             # the eager init. local_rank is not available in torch
             # ProcessGroup, see https://github.com/pytorch/pytorch/issues/122816
@@ -1683,6 +1689,7 @@ def init_distributed_environment(
                 timeout=timeout,
             )
         else:
+            # ──【NCCL 通信】常规模式：直接建 WORLD 进程组（NCCL communicator 惰性创建）──
             # this backend is used for WORLD
             # 作用：所有 worker 通过 TCP rendezvous 握手，建出 WORLD process group
             torch.distributed.init_process_group( # 真正建群的动作
@@ -1692,6 +1699,7 @@ def init_distributed_environment(
                 rank=rank,
                 timeout=timeout,
             )
+        # ──【EP/EPLB】弹性 EP：额外建一个 gloo CPU 组用于协调 TP/PP 组初始化 ──
         if enable_elastic_ep:
             tp_pp_cpu_group = torch.distributed.new_group(
                 backend="gloo", timeout=timeout
@@ -1704,9 +1712,11 @@ def init_distributed_environment(
                     "Elastic EP is not yet supported with multi-node TP/PP"
                 )
 
+    # ──【NCCL 通信】split_group 模式下校验默认进程组的切分一致性 ──
     if envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP and torch.accelerator.is_available():
         _validate_default_pg_for_split_group()
 
+    # ──【进程管理】补全 local_rank：单机场景直接以 rank 作为 local_rank ──
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
     # see https://github.com/pytorch/pytorch/issues/122816
@@ -1715,10 +1725,12 @@ def init_distributed_environment(
         # setting, where we can use rank as local rank
         local_rank = envs.LOCAL_RANK if distributed_init_method == "env://" else rank
 
+    # ──【EP/EPLB】弹性 EP 走独立初始化路径（StatelessGroupCoordinator），完成后直接返回 ──
     global _WORLD, _NODE_COUNT, _INNER_DP_WORLD
     if enable_elastic_ep:
         _init_elastic_ep_world(config, local_rank, backend, rank, world_size)
         return
+    # ──【NCCL 通信】用 vLLM 的 GroupCoordinator 包装 WORLD 组，提供高层通信接口并探测节点数 ──
     if _WORLD is None:
         ranks = list(range(torch.distributed.get_world_size()))
 
@@ -1736,6 +1748,7 @@ def init_distributed_environment(
         assert _WORLD.world_size == torch.distributed.get_world_size(), (
             "world group already initialized with a different world size"
         )
+    # ──【DP】跨节点 DP（nnodes_within_dp>1）时，为每个 DP 副本建内部 world 组用于消息广播 ──
     if config is not None and config.parallel_config.nnodes_within_dp > 1:
         if parallel_config.data_parallel_size > 1:
             world_size_inner_dp = parallel_config.world_size

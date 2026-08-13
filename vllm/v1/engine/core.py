@@ -160,6 +160,7 @@ class EngineCore:
         executor_fail_callback: Callable | None = None,
         include_finished_set: bool = False,
     ):
+        # ── 插件加载：注册用户扩展（核心逻辑，非优化） ──
         # plugins need to be loaded at the engine/scheduler level too
         from vllm.plugins import load_general_plugins
 
@@ -177,24 +178,31 @@ class EngineCore:
         # Opaque weight version supplied by the caller.
         self._weight_version = "default"
 
+        # ──【进程管理 + 异步 RPC】构造执行器：本地代理 worker 进程，后续经 Future/RPC 驱动 ──
         # Setup Model.
         self.model_executor = executor_class(vllm_config) # 1. 构造一个执行器类
         self._pooler_config_logged = False
         if executor_fail_callback is not None:
             self.model_executor.register_failure_callback(executor_fail_callback)
 
+        # ──【显存 profiling】预留 KV cache 显存容量字段，稍后由 profiling 回填 ──
         self.available_gpu_memory_for_kv_cache = -1 # 2. 每个引擎后端来管理他的逻辑KVcache 的 显存容量
 
+        # ──【EP/EPLB】弹性专家并行扩缩容：在 KV 初始化前先完成 EEP scale-up ──
         if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
             self._eep_scale_up_before_kv_init()
 
         # Setup KV Caches and update CacheConfig after profiling.
+        # ──【显存 profiling】初始化 KV cache（内部做显存 profiling + 预热），返回配置 ──
         kv_cache_config = self._initialize_kv_caches(vllm_config) # 驱动执行器去初始化kv cache
+        # ──【结构化输出/grammar】构造结构化输出管理器，编译/管理 grammar bitmask ──
         self.structured_output_manager = StructuredOutputManager(vllm_config) # 结构化输出管理器
 
+        # ── 核心：构造调度器（连续批处理、请求队列、KV 块分配都在其中） ──
         # Setup scheduler.
-        Scheduler = vllm_config.scheduler_config.get_scheduler_cls() 
+        Scheduler = vllm_config.scheduler_config.get_scheduler_cls()
 
+        # ──【chunked prefill】无 KV cache 的模型不支持 chunked prefill，自动关闭 ──
         if len(kv_cache_config.kv_cache_groups) == 0:  # noqa: SIM102
             # Encoder models without KV cache don't support
             # chunked prefill. But do SSM models?
@@ -215,10 +223,12 @@ class EngineCore:
             block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
         )
+        # ──【投机解码】标记是否启用投机解码/diffusion，决定 step 后是否取 draft token ──
         self.use_spec_decode = vllm_config.speculative_config is not None
         self.check_for_draft_tokens = (
             self.use_spec_decode or vllm_config.model_config.is_diffusion
         )
+        # ──【PD 分离】调度器带 connector 时，让执行器聚合 KV 输出供远端 decoder 消费 ──
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
 
@@ -230,6 +240,7 @@ class EngineCore:
         # If a KV connector is initialized for scheduler, we want to collect
         # handshake metadata from all workers so the connector in the scheduler
         # will have the full context
+        # ──【PD 分离】收集各 worker 的 KV 传输握手元数据，供 prefill→decode 跨实例传输 ──
         kv_connector = self.scheduler.get_kv_connector() # 这个是调度器里的 KVcache的跨引擎传输用的，用于PD分离的通信管道
         if kv_connector is not None:
             # Collect and store KV connector xfer metadata from workers
@@ -248,6 +259,7 @@ class EngineCore:
                         content.update(worker_dict)
                 kv_connector.set_xfer_handshake_metadata_pp_aware(content)
 
+        # ──【PP】流水线并行的批处理队列：异步调度/执行以消除气泡，单卡关闭 ──
         # Setup batch queue for pipeline parallelism.
         # Batch queue for scheduled batches. This enables us to asynchronously
         # schedule and execute batches, and is required by pipeline parallelism
@@ -269,6 +281,7 @@ class EngineCore:
         )
         self.is_pooling_model = vllm_config.model_config.runner_type == "pooling"
 
+        # ──【前缀缓存】按 block hash 复用已算 KV，命中前缀只算增量 token ──
         # 4. 前缀缓存的哈希函数
         self.request_block_hasher: Callable[[Request], list[BlockHash]] | None = None
         if vllm_config.cache_config.enable_prefix_caching or kv_connector is not None:
@@ -281,8 +294,9 @@ class EngineCore:
                 hash_block_size, caching_hash_fn
             )
 
+        # ──【PP】选择主循环：有批处理队列走 step_with_batch_queue，否则走 step ──
         # 选择引擎的主循环用哪个函数
-        self.step_fn = ( 
+        self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
@@ -291,6 +305,7 @@ class EngineCore:
 
         self._idle_state_callbacks: list[Callable] = []
 
+        # ── GC 优化：冻结启动期堆内存，减少老年代 GC 停顿（非并行优化） ──
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
         freeze_gc_heap()
@@ -308,9 +323,11 @@ class EngineCore:
         #   get_kv_cache_specs → determine_available_memory(profile) → initialize_from_config → compile_or_warm_up_model
         start = time.time()
 
+        # ── 在 enginecore 进程内注册所有 KV cache spec 类型 ──
         # register all kvcache specs in enginecore process.
         register_all_kvcache_specs(vllm_config)
 
+        # ──【异步 RPC】向 worker 询问模型各层所需的 KV cache spec ──
         # Get all kv cache needed by the model
         kv_cache_specs = self.model_executor.get_kv_cache_specs()
 
@@ -320,6 +337,7 @@ class EngineCore:
         # so this is the multiproc-safe place to translate that layer-level
         # signal into a scheduling policy: chunked prefill and prefix caching
         # both assume causal attention and would corrupt non-causal prefill.
+        # ──【chunked prefill + 前缀缓存】非因果注意力层会破坏这两种策略，检测到即自动关闭 ──
         if any(
             getattr(spec, "non_causal", False)
             for worker_specs in kv_cache_specs
@@ -336,6 +354,7 @@ class EngineCore:
                 )
                 vllm_config.cache_config.enable_prefix_caching = False
 
+        # ──【显存 profiling】探测模型峰值显存，算出可分配给 KV cache 的余量 ──
         has_kv_cache = any(kv_cache_spec for kv_cache_spec in kv_cache_specs)
         if has_kv_cache:
             if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
@@ -356,6 +375,7 @@ class EngineCore:
 
         assert len(kv_cache_specs) == len(available_gpu_memory)
 
+        # ──【异步 RPC】auto-fit 若压缩 max_model_len，广播新值回各 worker ──
         # Track max_model_len before KV cache config to detect auto-fit changes
         max_model_len_before = vllm_config.model_config.max_model_len
 
@@ -370,6 +390,7 @@ class EngineCore:
         if max_model_len_after != max_model_len_before:
             self.collective_rpc("update_max_model_len", args=(max_model_len_after,))
 
+        # ── 生成调度器侧 KV cache 配置并回写 num_gpu_blocks ──
         scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
         vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
         kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups
@@ -381,7 +402,9 @@ class EngineCore:
 
         vllm_config.validate_block_size()
 
+        # ──【异步 RPC】下发 KV cache 配置到 worker 分配显存 ──
         self.model_executor.initialize_from_config(kv_cache_configs)
+        # ──【CUDA Graph】编译/预热模型：捕获 CUDA Graph 供后续 step 回放 ──
         if not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
             self.model_executor.compile_or_warm_up_model()
 
@@ -657,6 +680,7 @@ class EngineCore:
 
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
+        # ── 空转检查：无请求直接返回，不触达 GPU ──
         if not self.scheduler.has_requests():
             return {}, False
 
@@ -664,13 +688,16 @@ class EngineCore:
         # 调度器调度一次
         # 执行器执行一个step
 
+        # ── 连续批处理调度：选取请求 + 分配 KV cache 块（核心逻辑） ──
         # 1. 调度器调度：选取请求 + 分配KVcache
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
 
 
 
         # 2. 执行器执行：GPU前向推理, 返回异步RPC的future
+        # ──【异步 RPC】非阻塞提交 GPU 前向，返回 Future，与采样/下一步调度流水重叠 ──
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        # ──【结构化输出/grammar】取语法 bitmask，约束采样 token 符合 schema ──
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output) # 获取语法模版
 
 
@@ -679,15 +706,18 @@ class EngineCore:
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
         ):
+            # ── 阻塞等待 Future 结果；未采样则在此处采样（logits→token） ──
             model_output = future.result() # 阻塞等待本轮调度的结果
             # 因为model runner返回的是未采样的logits这个分布状态，被存放到self.execute_model_state, 所以返回是空的
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
 
+        # ── 处理执行期间到达的中止请求 ──
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
 
+        # ── 用模型输出回填调度器状态（完成/计数/前缀缓存命中） ──
         # 3. 根据执行器结果，更新调度器的计数状态
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output

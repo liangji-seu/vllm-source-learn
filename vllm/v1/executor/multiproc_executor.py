@@ -82,6 +82,7 @@ class FutureWrapper(Future):
         get_response: Callable[[], Any],
         aggregate: Callable = lambda x: x,
     ):
+        # ──【异步 RPC】构造时把自己压入 FIFO 队列：executor 按入队顺序 drain 结果 ──
         self.futures_queue = futures_queue
         self.get_response = get_response
         self.aggregate = aggregate
@@ -92,6 +93,7 @@ class FutureWrapper(Future):
         if timeout is not None:
             raise RuntimeError("timeout not implemented")
 
+        # ──【异步 RPC】顺序性保证：先 drain 队列中比自己更早的 Future 再取自身结果 ──
         # Drain any futures ahead of us in the queue.
         while not self.done():
             future = self.futures_queue.pop()
@@ -99,6 +101,7 @@ class FutureWrapper(Future):
         return super().result()
 
     def _wait_for_response(self):
+        # ──【异步 RPC】真正取回结果：调 get_response 读响应队列，聚合后 set_result ──
         try:
             response = self.aggregate(self.get_response())
             with suppress(InvalidStateError):
@@ -172,6 +175,7 @@ class MultiprocExecutor(Executor):
 
         # weakref库，弱引用库，不增加对象引用的情况下访问对象
         # finalize, 这个库里面的注册清理回调的工具
+        # ──【进程管理】注册析构钩子：executor 被 GC 时自动 shutdown 清理 worker 进程 ──
         # 我们这边注册multiprocexecutor对象的退出钩子函数：shutdown
         self._finalizer = weakref.finalize(self, self.shutdown) # 对象析构的钩子，如果实例对象被GC回收了，自动调用shutdown()清理worker进程
 
@@ -181,8 +185,9 @@ class MultiprocExecutor(Executor):
 
 
 
+        # ──【TP + PP + PCP】读取张量/流水线/prefill-context 并行度并校验 world_size ──
         # 获取并行参数
-        tp_size, pp_size, pcp_size = self._get_parallel_sizes() 
+        tp_size, pp_size, pcp_size = self._get_parallel_sizes()
         assert self.world_size == tp_size * pp_size * pcp_size, (
             f"world_size ({self.world_size}) must be equal to the "
             f"tensor_parallel_size ({tp_size}) x pipeline"
@@ -204,6 +209,7 @@ class MultiprocExecutor(Executor):
         子进程继承这个环境变量后 torch 启动时就只用 16 个线程。
         ? 这里还不是很理解
         '''
+        # ──【进程管理】设置多进程环境：强制 spawn 启动 + 按 world_size 均分 CPU 线程数 ──
         set_multiprocessing_worker_envs(self.local_world_size) # 设置每个worker的pytorch c++ 计算的线程数，这样每个worker的pytorch计算互不影响
 
 
@@ -218,12 +224,14 @@ class MultiprocExecutor(Executor):
             作用：让本机所有 Worker 进程互相发现、建立 NCCL 集合通信。
         '''
         # 就是返回一个socket通信的地址：tcp://127.0.0.1:29500
+        # ──【NCCL 通信】生成 rendezvous 地址(tcp://127.0.0.1:端口)，供 worker 初始化分布式进程组 ──
         distributed_init_method = get_distributed_init_method( # 给 torch.distributed.init_process_group() 的 rendezvous 地址
             get_loopback_ip(), get_open_port() # 127.0.0.1 可用端口号
         )
 
+        # ──【异步 RPC】广播/响应队列占位：Scheduler→Worker 指令走广播 MQ，Worker→Scheduler 走响应 MQ ──
         # 构造调度任务的广播的环形缓冲区
-        self.rpc_broadcast_mq: MessageQueue | None = None 
+        self.rpc_broadcast_mq: MessageQueue | None = None
 
         # 连接信息
         scheduler_output_handle: Handle | None = None 
@@ -263,6 +271,7 @@ class MultiprocExecutor(Executor):
             node_rank_within_dp == 0：这个 Executor 额外负责创建广播 MessageQueue，把 SchedulerOutput 推送出去给同 DP 组的其他节点
             node_rank_within_dp != 0：这个 Executor 不创建广播队列，它只管理自己的 Worker，SchedulerOutput 从 leader 那边收
         '''
+        # ──【DP】仅 DP 组 leader 节点创建广播 MQ：非 leader 节点从 leader 收 SchedulerOutput ──
         # 只有 DP 组内的 leader 节点创建广播消息队列：一个模型副本，只有一个主节点发布消息
         if self.parallel_config.node_rank_within_dp == 0: # DP组内的节点编号
             # For leader node within each dp rank,
@@ -307,6 +316,7 @@ class MultiprocExecutor(Executor):
         unready_workers: list[UnreadyWorkerProcHandle] = []
         success = False
 
+        # ──【进程管理】逐个 GPU 拉起 Worker 子进程，并搭建 ready/death 两条 IPC 管道 ──
         # 创建N个worker进程 + 搭建IPC通信链路
         try:
             global_start_rank = (
@@ -358,20 +368,24 @@ class MultiprocExecutor(Executor):
             # Workers must be created before wait_for_ready to avoid
             # deadlock, since worker.init_device() does a device sync.
 
+            # ──【进程管理】就绪握手：阻塞等待每个 worker 通过 ready_pipe 回传 READY + 响应 MQ 句柄 ──
             # Wait for all local workers to be ready.
             # 等待所有worker子进程启动完成连接
-            self.workers = WorkerProc.wait_for_ready(unready_workers) 
+            self.workers = WorkerProc.wait_for_ready(unready_workers)
 
             # The workers have inherited their thread count (see
             # set_multiprocessing_worker_envs); this process only schedules, so
             # it gets no benefit from torch intra-op parallelism, just CPU
             # contention with them.
+            # ──【进程管理】Scheduler 进程只调度不算矩阵，关掉 torch 的 CPU 并行避免与 worker 抢核 ──
             set_torch_threads_for_runtime() # 用户手动设了 OMP_NUM_THREADS: return   # 尊重用户，不动
 
+            # ──【进程管理】启动后台线程监控 worker 存活，异常退出时触发 failure_callback ──
             # Start background thread to monitor worker health if not in headless mode.
             if self.monitor_workers:
                 self.start_worker_monitor()
 
+            # ──【异步 RPC + DP】收集响应队列：本节点直连，跨节点经 driver worker 的 peer 句柄 ──
             self.response_mqs = [] # 收集每个worker的响应通道
             # Only leader node have remote response mqs
             if self.parallel_config.node_rank_within_dp == 0: # 主executor in DP
@@ -404,12 +418,14 @@ class MultiprocExecutor(Executor):
             ③ executor 广播 "READY"             → executor 主动发（这一步才对应你说的"发布消息"）
             ④ worker 收到 "READY"              = 确认「通道能真正送达」
             '''
+            # ──【异步 RPC】等待广播/响应队列握手就绪：确保所有 worker 已订阅、通道可送达 ──
             if self.rpc_broadcast_mq is not None:
                 self.rpc_broadcast_mq.wait_until_ready()
             # Wait for all remote response mqs to be ready.
             for response_mq in self.response_mqs:
                 response_mq.wait_until_ready() # 等待每个worker的响应通道都就绪
 
+            # ──【异步 RPC】Future 先进先出队列：保证非阻塞 RPC 结果按发出顺序被取走 ──
             # 异步RPC的future FIFI队列
             self.futures_queue = deque[FutureWrapper]()
 
@@ -426,6 +442,7 @@ class MultiprocExecutor(Executor):
                         uw.death_writer = None
                 self._ensure_worker_termination([uw.proc for uw in unready_workers])
 
+        # ──【TP + PP】记录唯一回传结果的 worker rank：TP rank=0 且 PP 最后一层 ──
         self.output_rank = self._get_output_rank()
 
 
@@ -554,6 +571,7 @@ class MultiprocExecutor(Executor):
     ) -> Any:
         """Returns single result if unique_reply_rank and/or kv_output_aggregator
         is provided, otherwise list."""
+        # ──【异步 RPC】前置检查：leader 节点才有广播 MQ；失败态直接抛错 ──
         assert self.rpc_broadcast_mq is not None, (
             "collective_rpc should not be called on follower node"
         )
@@ -563,6 +581,7 @@ class MultiprocExecutor(Executor):
         deadline = None if timeout is None else time.monotonic() + timeout
         kwargs = kwargs or {}
 
+        # ──【PD 分离】若带 KV 聚合器则收集所有 worker 的 KV 传输结果再合并，而非只取单 rank ──
         if kv_output_aggregator is not None:
             output_rank = None
             aggregate: Callable[[Any], Any] = partial(
@@ -572,6 +591,7 @@ class MultiprocExecutor(Executor):
             output_rank = unique_reply_rank
             aggregate = lambda x: x
 
+        # ──【异步 RPC】把 (方法, 参数, 结果 rank) 打包后广播进 MessageQueue，唤醒所有 worker ──
         if isinstance(method, str):
             send_method = method
         else:
@@ -583,6 +603,7 @@ class MultiprocExecutor(Executor):
             response_mqs = (response_mqs[output_rank],)
 
 
+        # ──【异步 RPC】定义取结果回调：逐个 dequeue 响应队列，检查 SUCCESS/FAILURE 并解包 ──
         # 定义如何从响应队列里面获取异步RPC的回复
         def get_response():
             responses = []
@@ -603,6 +624,7 @@ class MultiprocExecutor(Executor):
             return responses[0] if output_rank is not None else responses
 
 
+        # ──【异步 RPC】包装成 Future 入队：non_block 立即返回，否则调用 result() 阻塞等待 ──
         # executor 发出RPC，远程过程调用，给worker， 肯定不能阻塞等待，给挂一个回调任务
         # 这个回调任务就是
         # 发出RPC后，不阻塞等待结果，直接包装一个Future，然后立刻返回。不等worker
@@ -877,6 +899,7 @@ class WorkerProc:
         shared_worker_lock: LockType,
         is_driver_worker: bool,
     ):
+        # ──【NCCL 通信】构造 WorkerWrapper 并 init_worker：各 rank 携带自己的初始化参数建立分布式进程组 ──
         self.rank = rank
         wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank) # 构造一个装饰器的实例，用来选择合适的Worker，并解析我们的指令
         # TODO: move `init_worker` to executor level as a collective rpc call
@@ -896,10 +919,12 @@ class WorkerProc:
         wrapper.init_worker(all_kwargs) 
         self.worker = wrapper
 
+        # ──【进程管理】设置进程名与日志前缀，带上 DP/TP/PP/EP 等并行 rank 便于排障 ──
         self.setup_proc_title_and_log_prefix(
             enable_ep=vllm_config.parallel_config.enable_expert_parallel
         )
 
+        # ──【进程管理】初始化 GPU 设备上下文：为 ModelRunner 分配设备、创建 runner 实例 ──
         # Load model
         # 2. 驱动内部Worker开始init_device, 为GPUModelRunner准备环境， 然后构造model_runner实例
         self.worker.init_device()
@@ -910,6 +935,7 @@ class WorkerProc:
         self.setup_proc_title_and_log_prefix(
             enable_ep=vllm_config.parallel_config.enable_expert_parallel
         )
+        # ──【CUDA Graph】加载模型权重，内部会把前向计算捕获成 CUDA Graph 加速回放 ──
         if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
             self.worker.elastic_ep_execute("load_model")
         else:
@@ -917,6 +943,7 @@ class WorkerProc:
             self.worker.load_model()
 
 
+        # ──【异步 RPC】若开启异步调度，额外起一个输出拷贝线程，把结果异步写回响应队列 ──
         # 启动一个异步输出拷贝线程
         scheduler_config = vllm_config.scheduler_config
         self.use_async_scheduling = scheduler_config.async_scheduling
@@ -939,6 +966,7 @@ class WorkerProc:
         # Set block size based on the attention backends
         current_platform.update_block_size_for_backend(vllm_config)
 
+        # ──【异步 RPC】建立与 Scheduler 的广播/响应 MessageQueue（多机时用分布式组创建远程 MQ） ──
         # Initialize message queues after init_device() since multi-node setups
         # (nnodes_within_dp > 1) require distributed groups to be initialized
         self._init_message_queues(input_shm_handle, vllm_config)
@@ -960,6 +988,7 @@ class WorkerProc:
         is_driver_worker: bool,
         inherited_fds: list[int] | None = None,
     ) -> UnreadyWorkerProcHandle:
+        # ──【进程管理】建两条单向管道：ready 通知父进程就绪，death 供子进程探测父进程退出 ──
         context = get_mp_context() # 获取启动的上下文环境
 
         # Ready pipe to communicate readiness from child to parent
@@ -970,6 +999,7 @@ class WorkerProc:
         if inherited_fds is not None:
             inherited_fds = inherited_fds.copy()
             inherited_fds.extend((ready_reader.fileno(), death_writer.fileno()))
+        # ──【进程管理】组装子进程启动参数：配置 + 连接句柄 + 两条管道 + fork 下需关闭的继承 fd ──
         process_kwargs = {
             "vllm_config": vllm_config,
             "local_rank": local_rank,
@@ -983,6 +1013,7 @@ class WorkerProc:
             # Have the worker close parent end of this worker's pipes too
             "inherited_fds": inherited_fds if inherited_fds is not None else [],
         }
+        # ──【进程管理】构建并启动 Worker 子进程（入口 worker_main），可选 NUMA 绑核 ──
         # Run EngineCore busy loop in background process.
         proc = context.Process( # 构建一个进程实例，入口为worker_main
             target=WorkerProc.worker_main,
@@ -997,6 +1028,7 @@ class WorkerProc:
         ):
             proc.start()
 
+        # ──【进程管理】父进程关闭子进程端，保留 death_writer 以便父退出时子进程收到 EOF ──
         # Close child ends of pipes here in the parent
         ready_writer.close()
         death_reader.close()
@@ -1106,6 +1138,7 @@ class WorkerProc:
         """Worker initialization and execution loops.
         This runs a background process"""
 
+        # ──【进程管理】注册 SIGTERM/SIGINT 处理：置位 shutdown_requested 并抛 SystemExit 优雅退出 ──
         # Signal handler used for graceful termination.
         # SystemExit exception is only raised once to allow this and worker
         # processes to terminate without error
@@ -1124,6 +1157,7 @@ class WorkerProc:
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
 
+        # ──【进程管理】提前发布逻辑→物理 GPU 映射并设置网卡设备环境变量，供后续拓扑工具使用 ──
         # Publish the logical-to-physical mapping early so topology helpers
         # work before init_device (needed by set_worker_net_device below).
         assigned_physical_gpu_ids = kwargs[
@@ -1137,6 +1171,7 @@ class WorkerProc:
         # Set net device env vars for the worker if VLLM_GPU_NIC_PCIE_MAPPING is set
         set_worker_net_device(kwargs.get("local_rank", 0), kwargs["vllm_config"])
 
+        # ──【进程管理】取出 ready/death 管道，并关闭 fork 继承来的其它 worker 管道避免 EOF 失效 ──
         worker = None
         ready_writer = kwargs.pop("ready_pipe")
         death_pipe = kwargs.pop("death_pipe", None)
@@ -1160,6 +1195,7 @@ class WorkerProc:
                 process_name=f"Worker_{rank}",
             )
 
+            # ──【进程管理】构建 WorkerProc（含 init_device/load_model/建队列），随后监听父进程存活 ──
             worker = WorkerProc(*args, **kwargs) # 构建workproc实例对象
             assert worker.worker_response_mq is not None
             if kwargs["vllm_config"].parallel_config.numa_bind:
@@ -1167,6 +1203,7 @@ class WorkerProc:
 
             worker.monitor_death_pipe(death_pipe, shutdown_requested)
 
+            # ──【异步 RPC】就绪握手：回传 READY 与响应 MQ 句柄，再等待广播/响应队列真正可用 ──
             # Send READY once we know everything is loaded # 发送READY给executor，告知回复的MessageQueue的联系方式
             ready_writer.send(
                 {
@@ -1184,8 +1221,10 @@ class WorkerProc:
             ready_writer.close()
             ready_writer = None
 
+            # ──【异步 RPC】进入主循环：持续 dequeue 广播指令、执行、回写结果 ──
             worker.worker_busy_loop() # 开始进入工作循环
 
+        # ──【进程管理】异常兜底：worker 启动/运行失败时置位关闭标志，避免 ZMQ 析构时二次抛异常 ──
         except Exception:
             # NOTE: if an Exception arises in busy_loop, we send
             # a FAILURE message over the MQ RPC to notify the Executor,
@@ -1285,10 +1324,12 @@ class WorkerProc:
         assert self.rpc_broadcast_mq is not None
 
         while True:
+            # ──【异步 RPC】阻塞 dequeue 广播指令：拿到要执行的 method 与目标结果 rank ──
             # 持续从广播队列里面接受指令
             method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(
                 indefinite=True
             )
+            # ──【异步 RPC】按 method 分发到 worker：字符串反射取方法 / 字节反序列化，执行后回写结果 ──
             try:
                 if isinstance(method, str):
                     func = getattr(self.worker, method) # 根据method构造func方法
@@ -1299,6 +1340,7 @@ class WorkerProc:
 
                 if output_rank is None or self.rank == output_rank:
                     self.handle_output(output) # 处理func的结果
+            # ──【异步 RPC】异常转失败响应：把不可序列化的异常转成字符串回传给 executor ──
             except Exception as e:
                 # Notes have been introduced in python 3.11
                 if hasattr(e, "add_note"):
@@ -1354,6 +1396,7 @@ def set_multiprocessing_worker_envs(local_world_size: int = 1):
     in a multiprocessing environment. This should be called by the parent
     process before worker processes are created"""
 
+    # ──【进程管理】强制 spawn 启动避免 fork 死锁；CPU 后端或用户已设线程数则直接返回 ──
     _maybe_force_spawn()
 
     if current_platform.is_cpu() or "OMP_NUM_THREADS" in os.environ: # os.environ里面没有OMP_NUM_THREADS，这个不是vllm的自定义环境变量
@@ -1364,6 +1407,7 @@ def set_multiprocessing_worker_envs(local_world_size: int = 1):
     # eagerly, and doing that part way through a worker's startup either races
     # the dlopen of shared objects or, in a forked worker, deadlocks (libgomp
     # is not fork-safe).
+    # ──【进程管理】按 world_size 均分 CPU 核数写入 OMP_NUM_THREADS，隔离各 worker 的线程争抢 ──
     num_threads = startup_omp_num_threads(local_world_size) # 计算每个进程的合适的线程核心数
     os.environ["OMP_NUM_THREADS"] = str(num_threads) # 设置好这个vllm的环境变量
     os.environ[OMP_NUM_THREADS_SET_BY_VLLM] = "1" # 已经设置过的标志位
@@ -1373,6 +1417,7 @@ def set_multiprocessing_worker_envs(local_world_size: int = 1):
     # here too. This is safe as long as we don't *use* the pool before forking:
     # a forked child whose parent had run a parallel region deadlocks, whereas
     # one whose parent merely sized the pool does not.
+    # ──【进程管理】父进程也同步设好线程数：spawn 子进程读环境变量，fork 子进程直接继承该值 ──
     torch.set_num_threads(num_threads) # 这里设置的是pytorch c++底层在worker进程内部 做cpu计算时开的工作线程，
     # 这样可以防止多个worker的内部线程 互相抢核心，相当于把多个worker的pytorch库的运算的核心给隔离开了
     logger.debug(
