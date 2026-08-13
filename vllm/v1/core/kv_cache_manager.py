@@ -54,6 +54,7 @@ class KVCacheBlocks:
 
     def __add__(self, other: "KVCacheBlocks") -> "KVCacheBlocks":
         """Adds two KVCacheBlocks instances."""
+        # ------【核心逻辑】按组逐 block 拼接两个分配结果，供上层累加不同来源的 block ------
         return KVCacheBlocks(
             tuple(
                 list(itertools.chain(blk1, blk2))
@@ -86,17 +87,20 @@ class KVCacheBlocks:
                 - each inner list contains the block_ids of the blocks in that
                   group
         """
+        # ------【核心逻辑】把 KVCacheBlock 对象序列转成 block_id，按 kv_cache_group 分组返回 ------
         if allow_none and all(len(group) == 0 for group in self.blocks):
             return None
         return tuple([blk.block_id for blk in group] for group in self.blocks)
 
     def get_unhashed_block_ids(self) -> list[int]:
         """Get block_ids of unhashed blocks from KVCacheBlocks instance."""
+        # ------【前缀缓存】筛出尚未登记哈希的 block，供后续计算哈希并写入 prefix cache ------
         assert len(self.blocks) == 1, "Only one group is supported"
         return [block.block_id for block in self.blocks[0] if block.block_hash is None]
 
     def get_unhashed_block_ids_all_groups(self) -> list[list[int]]:
         """Get block_ids of unhashed blocks from KVCacheBlocks instance."""
+        # ------【前缀缓存】遍历所有 kv_cache_group 收集未哈希且非填充的 block，供批量写缓存 ------
         # Skip padding blocks.
         return [
             [
@@ -111,6 +115,7 @@ class KVCacheBlocks:
         """
         Creates a new KVCacheBlocks instance with no blocks.
         """
+        # ------【核心逻辑】构造与当前组数一致的空分配结果，避免重复分配新对象 ------
         return KVCacheBlocks(tuple(() for _ in range(len(self.blocks))))
 
 
@@ -189,6 +194,7 @@ class KVCacheManager:
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
     ) -> None:
+        # ------【核心逻辑】记录最大上下文长度，未显式给定在途 token 上限时回退到该值 ------
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
         # collapses to the prior (uncapped) admission behavior. The scheduler
@@ -196,6 +202,7 @@ class KVCacheManager:
         if max_in_flight_tokens is None:
             max_in_flight_tokens = max_model_len
 
+        # ------【核心逻辑】缓存开关/事件/投机解码/统计等运行标志与指标收集器注入 ------
         self.enable_caching = enable_caching
         self.enable_kv_cache_events = enable_kv_cache_events
         self.use_eagle = use_eagle
@@ -204,8 +211,10 @@ class KVCacheManager:
         # FIXME: make prefix cache stats conditional on log_stats. We still need
         # this comment because when the log stats is enabled there are still
         # potential configs we could expose in the future.
+        # ------【前缀缓存】仅在开启统计时构造 prefix cache 命中统计对象，省内存 ------
         self.prefix_cache_stats = PrefixCacheStats() if log_stats else None
 
+        # ------【核心逻辑】工厂方法按配置创建单组/混合 KV 协调器，并取出物理 block 池句柄 ------
         self.coordinator = get_kv_cache_coordinator(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
@@ -225,8 +234,10 @@ class KVCacheManager:
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
+        # ------【核心逻辑】watermark 按比例折算为保留的最小空闲 block 数，防频繁抢占 ------
         assert watermark >= 0.0, "watermark must be non-negative"
         self.watermark_blocks = int(watermark * kv_cache_config.num_blocks)
+        # ------【核心逻辑】为每个 kv_cache_group 预取 (类型, 滑动窗口) 元数据供事件标注 ------
         self.kv_cache_event_metadata = tuple(
             (
                 get_kv_cache_spec_kind(group.kv_cache_spec).value,
@@ -240,10 +251,12 @@ class KVCacheManager:
         # overhead.
         #
         # We use nested tuples to ensure the empty KVCacheBlocks is immutable.
+        # ------【核心逻辑】预构造不可变的空 KVCacheBlocks，复用对象以减少 GC 开销 ------
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
 
+        # ------【PD 分离】记录已交给 connector 离线搬运的 COW block 的 pin，释放时一并回收 ------
         # Off-table cow blocks handed to a KV connector for partial-tail
         # offload; pinned until the request's blocks are freed.
         self._partial_tail_pins: dict[str, list[KVCacheBlock]] = {}
@@ -255,6 +268,7 @@ class KVCacheManager:
         Returns:
             The KV cache usage (between 0.0 and 1.0).
         """
+        # ------【核心逻辑】直接透传底层 block 池的使用率 (0.0~1.0) ------
         return self.block_pool.get_usage()
 
     def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
@@ -263,6 +277,7 @@ class KVCacheManager:
         Returns:
             The current prefix caching stats, or None if logging is disabled.
         """
+        # ------【前缀缓存】取出当前命中统计并重置为空对象，供日志侧一次性消费 ------
         if not self.log_stats:
             return None
         stats = self.prefix_cache_stats
@@ -271,9 +286,11 @@ class KVCacheManager:
 
     def prefix_cache_lookup_enabled(self, request: Request) -> bool:
         """Whether a local prefix cache lookup may be run for this request."""
+        # ------【前缀缓存】请求需同时满足全局缓存开启且未被标记跳过读缓存才允许查前缀 ------
         return self.enable_caching and not request.skip_reading_prefix_cache
 
     def record_prefix_cache_stats(self, request: Request, num_hits: int) -> None:
+        # ------【前缀缓存】命中统计按请求记录命中 token 数及是否被抢占 ------
         # Don't count a request that skipped the cache lookup.
         if not self.log_stats or not self.prefix_cache_lookup_enabled(request):
             return
@@ -301,6 +318,7 @@ class KVCacheManager:
                   Pinned so ``VLLM_PREFIX_CACHE_RETENTION_INTERVAL`` does not drop
                   the junction and defeat cross-request reuse.
         """
+        # ------【前缀缓存】缓存关闭或请求跳过读缓存时直接返回空命中 ------
         # We skip finding the prefix cache hit when prefix caching is
         # disabled or the request is marked as skipping kv cache read
         # (which happens when the request requires prompt logprobs
@@ -314,6 +332,7 @@ class KVCacheManager:
         # the single last token, because allocate_slots() requires
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
+        # ------【前缀缓存】以 prompt 长度-1 为上限查最长公共前缀，留最后一 token 算 logits ------
         max_cache_hit_length = request.num_tokens - 1
         computed_blocks, num_new_computed_tokens, num_uncached = (
             self.coordinator.find_longest_cache_hit(
@@ -321,6 +340,7 @@ class KVCacheManager:
             )
         )
 
+        # ------【异步 RPC+前缀缓存】full 上报模式时把复用块作为 BlockStored 事件推给外部消费方 ------
         # When kv_cache_report_mode is "full", emit BlockStored events
         # for the reused prefix cache blocks so that external consumers
         # (e.g. gateway) can learn about them.
@@ -345,10 +365,12 @@ class KVCacheManager:
         # (``num_new_computed_tokens``) plus the uncached shared prefix -- i.e.
         # the longest single-group hit. Sub-block gaps are left to the mask,
         # which floors to the alignment boundary (a no-op there).
+        # ------【前缀缓存】稀疏保留组的共享前缀边界=已命中 token + 未缓存的公共前缀 ------
         shared_prefix_boundary = (
             num_new_computed_tokens + num_uncached if num_uncached else 0
         )
 
+        # ------【核心逻辑】把命中 block 包成 KVCacheBlocks 与命中 token 数、边界一起返回 ------
         blocks = self.create_kv_cache_blocks(computed_blocks)
         return blocks, num_new_computed_tokens, shared_prefix_boundary
 
@@ -373,6 +395,7 @@ class KVCacheManager:
             The ``get_computed_blocks`` triple (blocks, number of local computed
             tokens, shared-prefix boundary) plus ``hit_diverged``.
         """
+        # ------【PD 分离】非 Mamba+全注意混合模型直接走标准前缀查找，命中未发散 ------
         coordinator = self.coordinator
         if not (
             self.kv_cache_config.has_mamba_layers
@@ -381,19 +404,23 @@ class KVCacheManager:
         ):
             return *self.get_computed_blocks(request), False
 
+        # ------【前缀缓存】缓存关闭或请求跳过时返回空命中 ------
         if not self.prefix_cache_lookup_enabled(request):
             return self.empty_kv_cache_blocks, 0, 0, False
 
+        # ------【PD 分离】按组分别查最长命中，比较全注意组与稀疏组命中深度 ------
         fa_group_id = coordinator.full_attention_group_id
         computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(
             request.block_hashes, request.num_tokens - 1
         )
+        # ------【PD 分离】稀疏组命中更深说明全注意块被驱逐，回退到共识边界重新对齐 ------
         if any(hit > per_group_hits[fa_group_id] for hit in per_group_hits):
             # A lagging group hit deeper than full attention means its
             # full-attention blocks were evicted; use the reconciled boundary
             # that every group agrees on.
             return *self.get_computed_blocks(request), False
 
+        # ------【PD 分离】取全注意组命中为本地前缀，边界填 0 并标记命中是否发散 ------
         num_local = per_group_hits[fa_group_id]
         blocks = self.create_kv_cache_blocks(computed)
         # Per-group lookups do not detect an uncached shared prefix (boundary 0).
@@ -497,12 +524,14 @@ class KVCacheManager:
         """
         # When loading KV data asynchronously, we may have zero new tokens to
         # compute while still allocating slots for externally computed tokens.
+        # ------【核心逻辑】无新增 token 也无外部已算 token 时属于非法调用，直接报错 ------
         if num_new_tokens == 0 and num_external_computed_tokens == 0:
             raise ValueError(
                 "num_new_tokens must be greater than 0 when there are no "
                 "external computed tokens"
             )
 
+        # ------【核心逻辑】归一化新命中 block 序列，未提供时复用空对象避免分配 ------
         if new_computed_blocks is not None:
             new_computed_block_list = new_computed_blocks.blocks
         else:
@@ -510,6 +539,7 @@ class KVCacheManager:
 
         # The number of computed tokens is the number of computed tokens plus
         # the new prefix caching hits
+        # ------【核心逻辑】累加本地与外部已算 token 得到总已算 token，并受最大长度约束 ------
         num_local_computed_tokens = (
             request.num_computed_tokens + num_new_computed_tokens
         )
@@ -518,6 +548,7 @@ class KVCacheManager:
             self.max_model_len,
         )
 
+        # ------【核心逻辑】仅对等待/被抢占请求且已有请求调度时启用 watermark 预留 ------
         watermark_blocks = 0
         # The watermark is applied to waiting/preempted requests only, and only
         # when there's at least one request already scheduled.
@@ -527,6 +558,7 @@ class KVCacheManager:
         ):
             watermark_blocks = self.watermark_blocks
 
+        # ------【chunked prefill】准入闸门：整条序列装不下时提前拒绝，避免 chunk 只查首块误放行 ------
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
@@ -545,6 +577,7 @@ class KVCacheManager:
             if required_blocks > self.block_pool.get_num_free_blocks():
                 return None
 
+        # ------【投机解码】主模型 token 数加 lookahead 草稿 token 得到需要占槽的总 token 数 ------
         num_tokens_main_model = total_computed_tokens + num_new_tokens
         num_tokens_need_slot = min(
             num_tokens_main_model + num_lookahead_tokens, self.max_model_len
@@ -559,12 +592,14 @@ class KVCacheManager:
         # Free on the processed-token basis: in-flight steps' attention windows
         # still read blocks below the optimistic boundary, and rejected spec
         # tokens can roll it back.
+        # ------【核心逻辑】先释放滑动窗口外/已处理过的 block，为新分配腾出空间 ------
         self.coordinator.remove_skipped_blocks(
             request.request_id,
             max(0, total_computed_tokens - request.num_in_flight_tokens),
             num_prompt_tokens=request.num_prompt_tokens,
         )
 
+        # ------【核心逻辑】由协调器按 token 与 block_size 计算出本次需分配的 block 数 ------
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
             num_tokens=num_tokens_need_slot,
@@ -578,12 +613,14 @@ class KVCacheManager:
 
         # Keep `reserved_blocks` free for other in-flight sequences, and an
         # additional watermark of headroom for waiting/preempted admissions.
+        # ------【核心逻辑】扣除 reserved/watermark 后空闲 block 不足则本次分配失败 ------
         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
         required_blocks = num_blocks_to_allocate + watermark_blocks
         if required_blocks > available_blocks:
             # Cannot allocate new blocks
             return None
 
+        # ------【前缀缓存】把前缀命中的 block 并入请求分配表，避免新块分配失败时丢失 ------
         if (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks
             or num_external_computed_tokens > 0
@@ -597,6 +634,7 @@ class KVCacheManager:
                 num_external_computed_tokens=num_external_computed_tokens,
             )
 
+        # ------【核心逻辑】真正从 block 池为新 token/编码器 token 分配物理 block ------
         new_blocks = self.coordinator.allocate_new_blocks(
             request.request_id,
             num_tokens_need_slot,
@@ -604,6 +642,7 @@ class KVCacheManager:
             num_encoder_tokens,
         )
 
+        # ------【PD 分离】关闭缓存或延迟缓存时跳过写缓存，仅返回新分配块 ------
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
         if not self.enable_caching or delay_cache_blocks:
@@ -614,6 +653,7 @@ class KVCacheManager:
         # "non-committable" tokens (e.g., draft tokens that could be rejected).
         # Therefore, we cap the number at `request.num_tokens`, ensuring only
         # "finalized" tokens are cached.
+        # ------【前缀缓存+投机解码】只把已定稿 token 写入缓存，剔除可能被拒绝的草稿 token ------
         num_tokens_to_cache = min(
             total_computed_tokens + num_new_tokens,
             request.num_tokens,
@@ -630,6 +670,7 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        # ------【PD 分离】先释放离线搬运 pin 住的 COW block，再释放请求主 block ------
         pins = self._partial_tail_pins.pop(request.request_id, None)
         if pins:
             self.block_pool.free_blocks(pins)
@@ -650,6 +691,7 @@ class KVCacheManager:
                 fully processed and committed tokens only (safe to free).
             num_prompt_tokens: Optional prompt length for R-SWA gap eviction.
         """
+        # ------【核心逻辑】透传请求 ID 与已处理 token 前缀，让协调器释放越界 block ------
         self.coordinator.remove_skipped_blocks(
             request_id, processed_computed_tokens, num_prompt_tokens
         )
@@ -665,10 +707,12 @@ class KVCacheManager:
         Returns:
             The request's blocks in allocation order.
         """
+        # ------【核心逻辑】取出请求账本 block 但不归还池，由调用方后续逆序释放 ------
         blocks = self.coordinator.pop_blocks_for_free(request.request_id)
         # Pins ride the same (possibly deferred) free as the request blocks.
         # Preemption may release a pin under a still-queued offload — the same
         # exposure normal saves of table blocks already have.
+        # ------【PD 分离】pin 块与请求 block 一并取出，抢占时避免离线搬运悬挂 ------
         pins = self._partial_tail_pins.pop(request.request_id, None)
         if pins:
             blocks = pins + blocks
@@ -680,6 +724,7 @@ class KVCacheManager:
         Args:
             block_ids: Set of block IDs to evict from cache.
         """
+        # ------【前缀缓存】按 block ID 集合强制驱逐前缀缓存条目 ------
         self.block_pool.evict_blocks(block_ids)
 
     def reset_prefix_cache(self) -> bool:
@@ -691,8 +736,10 @@ class KVCacheManager:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
+        # ------【权重传输】权重热更新后重置前缀缓存使旧哈希失效，RLHF 常用 ------
         if not self.block_pool.reset_prefix_cache():
             return False
+        # ------【前缀缓存】重置时同步打标统计，供日志上报重置事件 ------
         if self.log_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.reset = True
@@ -730,6 +777,7 @@ class KVCacheManager:
             list[int]: The number of common prefix blocks for each kv cache
             group.
         """
+        # ------【核心逻辑】透传计算所有在途请求共享的公共前缀 block 数 ------
         return self.coordinator.get_num_common_prefix_blocks(running_request_id)
 
     def take_events(self) -> list[KVCacheEvent]:
@@ -738,6 +786,7 @@ class KVCacheManager:
         Returns:
             A list of KV cache events.
         """
+        # ------【异步 RPC】取出 block 池事件队列，为 BlockStored 补上 KV 语义元数据 ------
         events = self.block_pool.take_events()
         for event in events:
             if not isinstance(event, BlockStored):
@@ -760,10 +809,12 @@ class KVCacheManager:
 
     def get_blocks(self, request_id: str) -> KVCacheBlocks:
         """Get the blocks of a request."""
+        # ------【核心逻辑】取出请求 block 并包装为 KVCacheBlocks ------
         return self.create_kv_cache_blocks(self.coordinator.get_blocks(request_id))
 
     def get_block_ids(self, request_id: str) -> tuple[list[int], ...]:
         """Get the block ids of a request."""
+        # ------【核心逻辑】取请求 block 后转成 block_id 序列 ------
         return self.get_blocks(request_id).get_block_ids()
 
     def get_block_ids_for_computed_tokens(
@@ -772,22 +823,26 @@ class KVCacheManager:
         num_computed_tokens: int,
     ) -> tuple[list[int], ...]:
         """Get block ids covering the request's computed tokens."""
+        # ------【核心逻辑】取请求 block id，按已算 token 数裁剪有效 block 前缀 ------
         block_ids = self.get_block_ids(request_id)
         clipped_block_ids: list[list[int]] = []
         for group, ids in zip(self.kv_cache_config.kv_cache_groups, block_ids):
             spec = group.kv_cache_spec
+            # ------【核心逻辑】交叉注意力/编码器组不参与裁剪，原样保留 ------
             if not isinstance(spec, AttentionSpec) or isinstance(
                 spec, (CrossAttentionSpec, EncoderOnlyAttentionSpec)
             ):
                 clipped_block_ids.append(ids)
                 continue
 
+            # ------【核心逻辑】按已算 token 与 block_size 算出有效块数并截取前缀 ------
             num_valid_blocks = cdiv(num_computed_tokens, spec.block_size)
             clipped_block_ids.append(ids[:num_valid_blocks])
         return tuple(clipped_block_ids)
 
     def estimate_cached_tokens(self, request: Request) -> int:
         """Estimate the number of tokens cached by the request."""
+        # ------【前缀缓存】逐组统计已缓存 token，跨组取最小值为全请求公共缓存量 ------
         cached_tokens: int | None = None
         for group, blocks in zip(
             self.kv_cache_config.kv_cache_groups,
@@ -800,6 +855,7 @@ class KVCacheManager:
                 # Cross-attention and encoder-only groups are not prefix cached.
                 continue
 
+            # ------【前缀缓存】组内取各 block 已缓存 token 数最大值作为该组缓存深度 ------
             group_cached_tokens = 0
             for block in blocks:
                 group_cached_tokens = max(
@@ -823,12 +879,14 @@ class KVCacheManager:
             num_computed_tokens: The number of computed tokens, including tokens
                 that are already cached and tokens to be cached.
         """
+        # ------【前缀缓存】缓存开启时把已算 token 对应的 block 写入前缀缓存索引 ------
         if self.enable_caching:
             self.coordinator.cache_blocks(request, num_computed_tokens)
 
     def create_kv_cache_blocks(
         self, blocks: tuple[list[KVCacheBlock], ...]
     ) -> KVCacheBlocks:
+        # ------【核心逻辑】仅非空才新建对象，否则复用预构造空对象省 GC ------
         # Only create new KVCacheBlocks for non-empty blocks
         return KVCacheBlocks(blocks) if any(blocks) else self.empty_kv_cache_blocks
 
@@ -839,6 +897,7 @@ class KVCacheManager:
 
         Pure slicing: refcounts are untouched and ``blocks`` is not mutated.
         """
+        # ------【前缀缓存】把查找结果按对齐 token 端点纯切片截断，不动引用计数 ------
         truncated: list[list[KVCacheBlock]] = []
         for group_blocks, manager in zip(
             blocks.blocks,
@@ -853,6 +912,7 @@ class KVCacheManager:
 
     def take_new_block_ids(self) -> list[int]:
         """Drain and return new attention block IDs for zeroing."""
+        # ------【异步 RPC】汇总各 manager 需要清零的新 block id 并清空待处理队列 ------
         ids: list[int] = []
         for mgr in self.coordinator.single_type_managers:
             ids.extend(mgr.take_new_block_ids())
@@ -863,6 +923,7 @@ class KVCacheManager:
     ) -> list[int]:
         """The request's block ids covering [start_token, end_token), from
         the groups whose new blocks are zeroed by the worker."""
+        # ------【异步 RPC】返回 [start,end) token 区间内需清零的 block id ------
         ids: list[int] = []
         for mgr in self.coordinator.single_type_managers:
             if mgr.records_new_block_ids:
@@ -879,6 +940,7 @@ class KVCacheManager:
         start_token must be block-aligned: zeroing a partially-valid block
         would wipe its valid prefix.
         """
+        # ------【异步 RPC】失败的异步 KV 加载留白后，从 start_token 起重新登记清零块 ------
         for mgr in self.coordinator.single_type_managers:
             if mgr.records_new_block_ids:
                 assert start_token % mgr.block_size == 0
@@ -890,6 +952,7 @@ class KVCacheManager:
         self,
     ) -> tuple[list[KVCacheBlockCopy], list[KVCacheBlock]]:
         """Drain pending copies and return their retained endpoints."""
+        # ------【内存池/CuMem】收集各 manager 待完成的 COW 拷贝，转为可下发结构并保留端点块 ------
         pending_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
         for mgr in self.coordinator.single_type_managers:
             pending_copies.extend(mgr.take_pending_cow_copies())
@@ -916,6 +979,7 @@ class KVCacheManager:
         pinned here and unpinned when the request's blocks are freed — for a
         producer with saved tokens, after the connector reports sends done.
         """
+        # ------【PD 分离】取出 mamba 组部分尾部离线搬运任务，pin 住块并登记边界信息 ------
         offloads: dict[str, list[tuple[int, int, int]]] = {}
         for mgr in self.coordinator.single_type_managers:
             for (
@@ -933,4 +997,5 @@ class KVCacheManager:
 
     def new_step_starts(self) -> None:
         """Notify the coordinator that a new step is starting."""
+        # ------【核心逻辑】通知协调器新一步开始，触发内部步级状态更新 ------
         self.coordinator.new_step_starts()

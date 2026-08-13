@@ -274,6 +274,7 @@ class SchedulerInterface(ABC):
     def has_unfinished_requests(self) -> bool:
         """Returns True if there are unfinished requests in the scheduler's
         internal queue."""
+        # ------【核心逻辑】用未完成请求计数是否>0 判断调度队列是否仍有工作，供引擎忙循环判断 ------
         return self.get_num_unfinished_requests() > 0
 
     '''
@@ -308,6 +309,7 @@ class SchedulerInterface(ABC):
     def has_requests(self) -> bool:
         """Returns True if there are unfinished requests, or finished requests
         not yet returned in SchedulerOutputs."""
+        # ------【核心逻辑】未完成或有待清理的已完成请求都算有工作，避免漏掉收尾步骤 ------
         return self.has_unfinished_requests() or self.has_finished_requests()
 
     '''
@@ -375,6 +377,7 @@ class SchedulerInterface(ABC):
     '''
     def get_kv_cache_usage(self) -> float:
         """Returns the fraction of the KV cache currently in use (0.0-1.0)."""
+        # ------【显存 profiling】返回 KV cache 占用比例(0.0-1.0)，基类默认 0.0 供显存规划与监控 ------
         return 0.0
 
 
@@ -410,10 +413,13 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     def get_kv_connector(self) -> "KVConnectorBase_V1 | None":
+        # ------【PD 分离】返回 KV connector 用于 prefill-decode 分离的 KV 传输，基类默认 None 未启用 ------
         return None
 
     def get_ec_connector(self) -> "ECConnectorBase | None":
+        # ------【异步 RPC】返回 Encoder Cache connector 用于分布式/P2P 编码器缓存异步收发，基类默认 None ------
         return None
 
     def get_kv_event_publisher_config(self) -> "KVEventsConfig | None":
+        # ------【ZMQ 通信】返回 KV 事件发布配置，供经 zmq 发布 KV 块存储/移除事件，基类默认 None ------
         return None

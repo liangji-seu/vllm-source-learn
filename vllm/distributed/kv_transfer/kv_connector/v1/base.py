@@ -111,10 +111,12 @@ class SupportsHMA(ABC):
             Optional KVTransferParams to be included in the request outputs
             returned by the engine.
         """
+        # ------【PD 分离】抽象方法：请求在所有 KV 组都结束时触发一次，决定是否异步接管块释放 ------
         raise NotImplementedError
 
 
 def supports_hma(connector: Any) -> bool:
+    # ------【PD 分离】判断 connector 是类还是实例，据此判定是否支持 HMA 混合显存分配 ------
     if isinstance(connector, type):
         return issubclass(connector, SupportsHMA)
     else:
@@ -135,6 +137,7 @@ class KVConnectorHandshakeMetadata(ABC):  # noqa: B024
     P/D workers. This needs to serializable.
     """
 
+    # ------【PD 分离】空基类仅作类型标记，具体握手元数据须可序列化以跨进程传递 ------
     pass
 
 
@@ -144,6 +147,7 @@ class KVConnectorMetadata(ABC):  # noqa: B024
     Scheduler KVConnector -> Worker KVConnector.
     """
 
+    # ------【PD 分离】空基类标记调度器侧下发到 worker 侧的连接器元数据 ------
     pass
 
 
@@ -165,6 +169,7 @@ class KVConnectorWorkerMetadata(ABC):
         """
         Aggregate metadata with another `KVConnectorWorkerMetadata` object.
         """
+        # ------【TP+PP】抽象方法：把多个 worker 回传的元数据聚合为一份再交调度器 ------
         pass
 
 
@@ -179,6 +184,7 @@ class KVConnectorBase_V1(ABC):
         Indicates whether this connector prefers KV blocks that hold KV data for all
         layers, which can speed up KV data transfers. Defaults to False.
         """
+        # ------【PD 分离】默认不偏好跨层共享块；开启后可减少逐层传输次数 ------
         return False
 
     @property
@@ -191,6 +197,7 @@ class KVConnectorBase_V1(ABC):
         producer hands KV off when a request completes. Best-effort caches
         return False, as a dropped save is just a future cache miss.
         """
+        # ------【PD 分离】仅生产者需可靠投递 KV；尽力而为缓存丢了也只是未来一次 miss ------
         return self._kv_transfer_config.is_kv_producer
 
     def __init__(
@@ -199,21 +206,26 @@ class KVConnectorBase_V1(ABC):
         role: KVConnectorRole,
         kv_cache_config: "KVCacheConfig",
     ):
+        # ------【核心逻辑】打日志提示该 KV 传输 API 仍属实验性质，接口可能变动 ------
         logger.warning(
             "Initializing KVConnectorBase_V1. This API is experimental and "
             "subject to change in the future as we iterate the design."
         )
+        # ------【核心逻辑】初始化连接器元数据为空，待调度器经 bind 下发给 worker ------
         self._connector_metadata: KVConnectorMetadata | None = None
         self._vllm_config = vllm_config
+        # ------【核心逻辑】强制要求 kv_transfer_config 存在，否则无传输参数可用 ------
         if vllm_config.kv_transfer_config is not None:
             self._kv_transfer_config = vllm_config.kv_transfer_config
         else:
             raise ValueError("kv_transfer_config must be set for KVConnectorBase_V1")
+        # ------【核心逻辑】缓存 KV cache 配置与进程角色，供后续 load/save 分支使用 ------
         self._kv_cache_config = kv_cache_config
         self._role = role
 
     @property
     def role(self) -> KVConnectorRole:
+        # ------【核心逻辑】暴露进程角色，便于区分调度器侧与 worker 侧的行为 ------
         return self._role
 
     # ==============================
@@ -230,6 +242,7 @@ class KVConnectorBase_V1(ABC):
         Args:
             connector_metadata (dict): the connector metadata.
         """
+        # ------【PD 分离】模型执行前由 model runner 写入调度器下发的元数据，供运行时 load/save 使用 ------
         self._connector_metadata = connector_metadata
 
     def clear_connector_metadata(self) -> None:
@@ -238,6 +251,7 @@ class KVConnectorBase_V1(ABC):
         This function should be called by the model runner every time
         after the model execution.
         """
+        # ------【PD 分离】模型执行后清空元数据，避免下次 step 误用上一次的加载指令 ------
         self._connector_metadata = None
 
     def _get_connector_metadata(self) -> KVConnectorMetadata:
@@ -249,6 +263,7 @@ class KVConnectorBase_V1(ABC):
             ConnectorMetadata: the connector metadata.
         """
         # Should only be called while set to valid metadata.
+        # ------【核心逻辑】断言元数据已被绑定，防止在未下发时访问空元数据 ------
         assert self._connector_metadata is not None
         return self._connector_metadata
 
@@ -258,6 +273,7 @@ class KVConnectorBase_V1(ABC):
         Returns:
             bool: True if connector metadata exists, False otherwise.
         """
+        # ------【核心逻辑】查询当前 step 是否有待执行的连接器元数据 ------
         return self._connector_metadata is not None
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
@@ -268,6 +284,7 @@ class KVConnectorBase_V1(ABC):
         Args:
             kv_caches: dictionary of layer names, kv cache
         """
+        # ------【核心逻辑】默认无操作；子类可预注册 KV cache 加速后续传输（如 NIXL） ------
         return
 
     def register_cross_layers_kv_cache(
@@ -285,6 +302,7 @@ class KVConnectorBase_V1(ABC):
             kv_cache: a cross-layers kv cache tensor
             attn_backend: The attention backend that corresponds to all layers
         """
+        # ------【PD 分离】默认无操作；跨层共享 KV 块可减少传输次数，需子类重写 ------
         return
 
     def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):
@@ -292,6 +310,7 @@ class KVConnectorBase_V1(ABC):
         Set the xPU-specific ops for copying KV between host and device.
         Needed when host buffer is used for kv transfer (e.g., in NixlConnector)
         """
+        # ------【异步 RPC】默认无操作；子类注入 host/device 间拷贝算子以支持主机缓冲传输 ------
         return
 
     def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata):
@@ -299,6 +318,7 @@ class KVConnectorBase_V1(ABC):
         Handle preempted requests or evicted blocks BEFORE they are overwritten.
         Needed for connectors which use async saves (e.g., OffloadingConnector)
         """
+        # ------【PD 分离+异步 RPC】默认无操作；在块被覆盖前处理被抢占/驱逐请求的异步保存 ------
         return
 
     @abstractmethod
@@ -317,6 +337,7 @@ class KVConnectorBase_V1(ABC):
             the same.
 
         """
+        # ------【PD 分离+异步 RPC】抽象方法：前向开始前启动异步加载 KV，与计算重叠隐藏传输延迟 ------
         pass
 
     @abstractmethod
@@ -331,6 +352,7 @@ class KVConnectorBase_V1(ABC):
         Args:
             layer_name: the name of that layer
         """
+        # ------【PD 分离+异步 RPC】抽象方法：阻塞等待某层 KV 到位，实现逐层流水线加载 ------
         pass
 
     @abstractmethod
@@ -353,6 +375,7 @@ class KVConnectorBase_V1(ABC):
             attn_metadata (AttentionMetadata): the attention metadata.
             **kwargs: additional arguments for the save operation.
         """
+        # ------【PD 分离+异步 RPC】抽象方法：注意力层内启动单层 KV 异步保存，与执行重叠 ------
         pass
 
     @abstractmethod
@@ -364,6 +387,7 @@ class KVConnectorBase_V1(ABC):
 
         This prevents overwrites of paged KV buffer before saving done.
         """
+        # ------【PD 分离+异步 RPC】抽象方法：前向退出时等待所有异步保存完成，防止 KV 缓冲被覆盖 ------
         pass
 
     def get_finished(
@@ -382,6 +406,7 @@ class KVConnectorBase_V1(ABC):
             The finished saves/sends req ids must belong to a set provided in a
             call to this method (this call or a prior one).
         """
+        # ------【异步 RPC】默认无已完成传输；返回 (保存完成集合, 加载完成集合) 供调度器跟踪 ------
         return None, None
 
     def get_block_ids_with_load_errors(self) -> set[int]:
@@ -402,6 +427,7 @@ class KVConnectorBase_V1(ABC):
             - Sync loading: failed blocks should be reported in the forward
               pass in which they are detected.
         """
+        # ------【PD 分离】默认无加载失败块；上报加载失败块 ID 供调度器降级/重算处理 ------
         return set()
 
     def shutdown(self):
@@ -410,12 +436,14 @@ class KVConnectorBase_V1(ABC):
         is shutting down to ensure that all the async operations are
         completed and the connector is cleaned up properly.
         """
+        # ------【异步 RPC】默认无操作；worker 退出时需等待所有异步传输完成并清理资源 ------
         return None
 
     def get_kv_connector_stats(self) -> "KVConnectorStats | None":
         """
         Get the KV connector stats collected during the last interval.
         """
+        # ------【显存 profiling】默认无统计；返回上个区间的传输统计用于观测吞吐与延迟 ------
         return None
 
     def get_kv_connector_kv_cache_events(self) -> "KVConnectorKVEvents | None":
@@ -424,6 +452,7 @@ class KVConnectorBase_V1(ABC):
         This function should be called by the model runner every time after the
         model execution and before cleanup.
         """
+        # ------【核心逻辑】默认无事件；返回上个区间的 KV cache 事件供前缀缓存等消费 ------
         return None
 
     def get_handshake_metadata(self) -> KVConnectorHandshakeMetadata | None:
@@ -436,6 +465,7 @@ class KVConnectorBase_V1(ABC):
             KVConnectorHandshakeMetadata: the handshake metadata.
             None if no handshake metadata is available.
         """
+        # ------【PD 分离】默认无握手元数据；P/D worker 间带外握手交换传输参数 ------
         return None
 
     def build_connector_worker_meta(self) -> KVConnectorWorkerMetadata | None:
@@ -446,6 +476,7 @@ class KVConnectorBase_V1(ABC):
             KVConnectorWorkerMetadata: the worker metadata.
             None if no worker metadata is available.
         """
+        # ------【PD 分离】默认无回传元数据；worker 侧结果聚合后回传调度器侧连接器 ------
         return None
 
     # ==============================
@@ -460,6 +491,7 @@ class KVConnectorBase_V1(ABC):
         Args:
             gpu_block_pool: the GPU block pool.
         """
+        # ------【前缀缓存】默认无操作；绑定 GPU 块池以跟踪引用计数/迭代前缀缓存块 ------
         return
 
     @abstractmethod
@@ -495,6 +527,7 @@ class KVConnectorBase_V1(ABC):
             connectivity issues or eviction), those tokens must not be taken
             into account.
         """
+        # ------【PD 分离+前缀缓存】抽象方法：查询外部 KV cache 可复用的新 token 数，供调度器决定加载量 ------
         pass
 
     @abstractmethod
@@ -521,6 +554,7 @@ class KVConnectorBase_V1(ABC):
             num_external_tokens (int): the number of tokens to load from the
                 external KV cache. 0 means nothing should be loaded.
         """
+        # ------【PD 分离】抽象方法：块分配后更新状态，记录本次需从外部加载的 token 数 ------
         pass
 
     @abstractmethod
@@ -536,6 +570,7 @@ class KVConnectorBase_V1(ABC):
         Args:
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
+        # ------【PD 分离】抽象方法：依据调度输出构建下发元数据，并重置本步连接器状态 ------
         pass
 
     def on_new_request(self, request: "Request") -> None:
@@ -544,6 +579,7 @@ class KVConnectorBase_V1(ABC):
         Connectors can override this to inspect the request and perform
         bookkeeping. The default implementation is a no-op.
         """
+        # ------【核心逻辑】默认无操作；新请求加入时子类可做登记/记账 ------
         return
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
@@ -554,6 +590,7 @@ class KVConnectorBase_V1(ABC):
             connector_output (KVConnectorOutput): the worker-side
                 connectors output.
         """
+        # ------【PD 分离】默认无操作；消费 worker 侧回传结果以更新调度器侧状态 ------
         return
 
     def request_finished(
@@ -575,6 +612,7 @@ class KVConnectorBase_V1(ABC):
             Optional KVTransferParams to be included in the request outputs
             returned by the engine.
         """
+        # ------【PD 分离】默认同步释放；返回 False 表示不接管块、由调度器立即释放 ------
         return False, None
 
     def take_events(self) -> Iterable["KVCacheEvent"]:
@@ -584,6 +622,7 @@ class KVConnectorBase_V1(ABC):
         Yields:
             New KV cache events since the last call.
         """
+        # ------【核心逻辑】默认无事件；拉取自上次调用以来新产生的 KV cache 事件 ------
         return ()
 
     def has_pending_push_work(self) -> bool:
@@ -596,6 +635,7 @@ class KVConnectorBase_V1(ABC):
         """
         # TODO: replace with a more general connector hook for keeping the
         # scheduler alive (e.g. extend has_unfinished_requests).
+        # ------【PD 分离】默认无推送任务；push 模式需主循环持续步进以写出 KV ------
         return False
 
     @classmethod
@@ -610,11 +650,13 @@ class KVConnectorBase_V1(ABC):
             None if the connector does not require a specific layout.
         """
 
+        # ------【核心逻辑】抽象基类禁止调用，防止基类被当作具体布局声明 ------
         if cls is KVConnectorBase_V1:
             raise TypeError(
                 "get_required_kvcache_layout should not be called "
                 "on the abstract base class"
             )
+        # ------【核心逻辑】默认不要求特定 KV cache 布局（如 HND/NHD），子类可重写 ------
         return None
 
     @classmethod
@@ -637,6 +679,7 @@ class KVConnectorBase_V1(ABC):
             True if this connector requires PIECEWISE CUDA graph mode,
             False otherwise.
         """
+        # ------【CUDA Graph】默认不要求分片图；逐层异步操作无法被捕获需启用 PIECEWISE ------
         return False
 
     def get_finished_count(self) -> int | None:
@@ -649,6 +692,7 @@ class KVConnectorBase_V1(ABC):
             int: expected sending or receiving completion count.
         """
 
+        # ------【异步 RPC】默认返回 None；用于初始化输出聚合器覆盖默认 world_size ------
         return None
 
     @classmethod
@@ -660,6 +704,7 @@ class KVConnectorBase_V1(ABC):
         registered connectors to return their own KVConnectorStats object,
         which can implement custom aggregation logic on the data dict.
         """
+        # ------【显存 profiling】默认无统计对象；动态注册的连接器可返回自定义聚合逻辑 ------
         return None
 
     def set_xfer_handshake_metadata(
@@ -671,6 +716,7 @@ class KVConnectorBase_V1(ABC):
         Args:
             metadata (KVConnectorHandshakeMetadata): the handshake metadata to set.
         """
+        # ------【PD 分离】默认无操作；接收对端 P/D worker 的握手元数据供传输协商 ------
         return None
 
     def set_xfer_handshake_metadata_pp_aware(
@@ -681,11 +727,13 @@ class KVConnectorBase_V1(ABC):
         - Default implementation assumes pp_rank is always 0
         - PP-aware connectors override this to consume all PP producer shards.
         """
+        # ------【PP】检测是否存在 pp_rank>0 的分片，若不支持 PP 分离则拒绝 ------
         if any(pp_rank != 0 for pp_rank, _ in metadata):
             raise ValueError(
                 f"{type(self).__name__} received pp_rank > 0 handshake metadata "
                 "but does not support PP-disaggregated KV transfer."
             )
+        # ------【PP+TP】默认忽略 PP 维度，仅按 tp_rank 重键并下发给子类 ------
         self.set_xfer_handshake_metadata(
             {tp_rank: meta for (_, tp_rank), meta in metadata.items()}
         )
@@ -703,6 +751,7 @@ class KVConnectorBase_V1(ABC):
         per-connector Prometheus metrics and implement observe() to
         expose connector transfer stats via Prometheus.
         """
+        # ------【显存 profiling】默认不建指标；子类注册 Prometheus 指标以暴露传输统计 ------
         return None
 
     def reset_cache(self) -> bool | None:
@@ -712,6 +761,7 @@ class KVConnectorBase_V1(ABC):
         Returns:
             bool: True if the cache was successfully reset, False otherwise.
         """
+        # ------【前缀缓存】默认未实现重置，仅打日志并返回 None 表示结果未知 ------
         logger.debug(
             "Connector cache reset requested, but %s does not implement reset_cache().",
             type(self).__name__,

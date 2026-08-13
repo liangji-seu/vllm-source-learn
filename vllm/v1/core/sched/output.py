@@ -54,6 +54,7 @@ class NewRequestData:
         block_ids: tuple[list[int], ...],
         prefill_token_ids: list[int] | None = None,
     ) -> "NewRequestData":
+        # ------【核心逻辑】把 Request 字段映射成 NewRequestData 首次调度整包下发，worker 缓存后免重复传输 ------
         return cls(
             req_id=request.request_id,
             prompt_token_ids=request.prompt_token_ids,
@@ -69,9 +70,11 @@ class NewRequestData:
         )
 
     def __repr__(self) -> str:
+        # ------【核心逻辑】只取 prompt_embeds 的形状而非张量内容，避免日志打印超长/敏感数据 ------
         prompt_embeds_shape = (
             self.prompt_embeds.shape if self.prompt_embeds is not None else None
         )
+        # ------【核心逻辑】拼接关键字段为可读字符串，便于日志/调试定位请求状态 ------
         return (
             f"NewRequestData("
             f"req_id={self.req_id},"
@@ -88,6 +91,7 @@ class NewRequestData:
 
     # Version of __repr__ with the prompt data obfuscated
     def anon_repr(self) -> str:
+        # ------【核心逻辑】只统计 prompt 相关字段长度做脱敏，避免日志泄露 prompt 原文内容 ------
         prompt_token_ids_len = (
             len(self.prompt_token_ids) if self.prompt_token_ids is not None else None
         )
@@ -97,6 +101,7 @@ class NewRequestData:
         prefill_token_ids_len = (
             len(self.prefill_token_ids) if self.prefill_token_ids is not None else None
         )
+        # ------【核心逻辑】用长度替代原文拼接脱敏后的请求信息，用于安全日志输出 ------
         return (
             f"NewRequestData("
             f"req_id={self.req_id},"
@@ -131,10 +136,12 @@ class CachedRequestData:
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:
+        # ------【核心逻辑】把 token 列表转为长度，脱敏后仅保留计数用于日志 ------
         new_token_ids_lens = [len(toks) for toks in self.new_token_ids]
         all_token_ids_lens = {
             req_id: len(toks) for req_id, toks in self.all_token_ids.items()
         }
+        # ------【核心逻辑】拼接缓存请求的脱敏信息，便于日志追踪增量调度状态 ------
         return (
             f"CachedRequestData("
             f"req_ids={self.req_ids},"
@@ -148,10 +155,12 @@ class CachedRequestData:
         )
 
     def __repr__(self) -> str:
+        # ------【核心逻辑】统一走 anon_repr，所有日志输出默认对 token 内容脱敏 ------
         return self.anon_repr()
 
     @property
     def num_reqs(self) -> int:
+        # ------【核心逻辑】返回本次缓存的请求数量，供调度器统计增量请求规模 ------
         return len(self.req_ids)
 
     @cached_property
@@ -162,14 +171,17 @@ class CachedRequestData:
         are created fresh each scheduling iteration and not mutated during
         computation of iteration details.
         """
+        # ------【核心逻辑】构建 req_id→输出 token 数的哈希映射，让后续查询 O(1) 而非线性扫描 ------
         return dict(zip(self.req_ids, self.num_output_tokens))
 
     def is_context_phase(self, req_id: str) -> bool:
+        # ------【核心逻辑】以输出 token 数是否为 0 判断请求是否仍处于 prefill/上下文阶段 ------
         num_output_tokens = self._req_id_to_num_output_tokens.get(req_id)
         return num_output_tokens is not None and num_output_tokens == 0
 
     @classmethod
     def make_empty(cls) -> "CachedRequestData":
+        # ------【核心逻辑】构造空的 CachedRequestData 占位对象，表示本轮没有已缓存的增量请求 ------
         return cls(
             req_ids=[],
             resumed_req_ids=set(),
@@ -270,6 +282,7 @@ class SchedulerOutput:
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
+        # ------【核心逻辑】构造空的 SchedulerOutput，作为无请求可调度时的默认返回值 ------
         return cls(
             scheduled_new_reqs=[],
             scheduled_cached_reqs=CachedRequestData.make_empty(),
