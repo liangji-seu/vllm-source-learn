@@ -1589,6 +1589,16 @@ def init_distributed_environment(
     backend: str = "nccl",
     timeout: timedelta | None = None,
 ):
+    '''
+    这就是你说的「构建 NCCL 通信网络」的确切位置。它做两件事：
+
+    rendezvous（握手）：所有 worker 通过 distributed_init_method（那个 tcp://ip:port 地址）互相找到对方，确认「咱们是同一伙人」
+    建 WORLD process group：登记好 world_size 和每个进程的 rank，形成一个全局通信组
+
+        一个容易误解的点：NCCL communicator 是「懒」的
+        init_process_group 只是「建群、登记名册、握手」。
+        真正的 NCCL communicator（GPU 之间那条物理通信链路）是在第一次发生 collective 通信（比如第一次 all-reduce）时才 lazy 创建的。
+    '''
     logger.debug(
         "world_size=%d rank=%d local_rank=%d distributed_init_method=%s backend=%s",
         world_size,
@@ -1664,7 +1674,7 @@ def init_distributed_environment(
                     if distributed_init_method == "env://"
                     else rank
                 )
-            _init_process_group_for_split_group(
+            _init_process_group_for_split_group( 
                 backend=backend,
                 distributed_init_method=distributed_init_method,
                 world_size=world_size,
@@ -1674,9 +1684,10 @@ def init_distributed_environment(
             )
         else:
             # this backend is used for WORLD
-            torch.distributed.init_process_group(
-                backend=backend,
-                init_method=distributed_init_method,
+            # 作用：所有 worker 通过 TCP rendezvous 握手，建出 WORLD process group
+            torch.distributed.init_process_group( # 真正建群的动作
+                backend=backend, # nccl
+                init_method=distributed_init_method, # 本worker的zmq的url
                 world_size=world_size,
                 rank=rank,
                 timeout=timeout,
@@ -1710,6 +1721,11 @@ def init_distributed_environment(
         return
     if _WORLD is None:
         ranks = list(range(torch.distributed.get_world_size()))
+
+        '''
+                作用：把刚才那个 WORLD group 用 vLLM 自己的 GroupCoordinator 包一层
+│                 （提供 rank_in_group、device_group、广播等高层接口）
+        '''
         _WORLD = init_world_group(ranks, local_rank, backend)
         if config is not None and config.parallel_config.nnodes > 1:
             _NODE_COUNT = config.parallel_config.nnodes

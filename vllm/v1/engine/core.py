@@ -189,7 +189,7 @@ class EngineCore:
             self._eep_scale_up_before_kv_init()
 
         # Setup KV Caches and update CacheConfig after profiling.
-        kv_cache_config = self._initialize_kv_caches(vllm_config) # kv cache的配置
+        kv_cache_config = self._initialize_kv_caches(vllm_config) # 驱动执行器去初始化kv cache
         self.structured_output_manager = StructuredOutputManager(vllm_config) # 结构化输出管理器
 
         # Setup scheduler.
@@ -302,6 +302,10 @@ class EngineCore:
 
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
+        # 【Worker 初始化 · 阶段 3/3】Initialize KV Cache
+        #   注意: 阶段 1(init_device)/2(load_model) 是 Worker 进程启动时自己直接调的;
+        #   阶段 3 由 EngineCore 编排, 通过 collective_rpc 远程驱动 worker:
+        #   get_kv_cache_specs → determine_available_memory(profile) → initialize_from_config → compile_or_warm_up_model
         start = time.time()
 
         # register all kvcache specs in enginecore process.
@@ -665,9 +669,9 @@ class EngineCore:
 
 
 
-        # 2. 执行器执行：GPU前向推理
+        # 2. 执行器执行：GPU前向推理, 返回异步RPC的future
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
-        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output) # 语法正确的输出
+        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output) # 获取语法模版
 
 
 
@@ -675,7 +679,8 @@ class EngineCore:
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
         ):
-            model_output = future.result()
+            model_output = future.result() # 阻塞等待本轮调度的结果
+            # 因为model runner返回的是未采样的logits这个分布状态，被存放到self.execute_model_state, 所以返回是空的
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
 

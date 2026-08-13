@@ -35,15 +35,49 @@ FailureCallback = Callable[[], None]
 
 
 class Executor(ABC):
-    """Abstract base class for vLLM executors."
+    """
+    === 类说明 ===
+        继承: ABC
+        职责: 执行器抽象基类。负责将 SchedulerOutput (调度任务) 分发到
+              Worker 执行模型 forward，并返回 ModelRunnerOutput。
+              封装了所有 Worker RPC 调用的统一入口 (collective_rpc)。
 
-    An executor is responsible for executing the model on one device,
-    or it can be a distributed executor that can execute the model on multiple devices.
+    === 子类 ===
+        MultiprocExecutor      — 单机多卡, 每 GPU 一个 Worker 进程, MessageQueue 通信
+        UniProcExecutor        — 单机单卡, 无 IPC, 直接调用
+        RayDistributedExecutor — 多机多卡, Ray 编排
+        ExecutorWithExternalLauncher — 外部启动器 (torchrun) 管理 Worker
+
+    === 工厂方法 ===
+        get_class(vllm_config) — @staticmethod, 根据配置选择合适的 Executor 子类
+
+    === 核心方法 (对外接口) ===
+        —— Worker 动作封装 (均通过 collective_rpc 广播) ——
+            execute_model(scheduler_output) → ModelRunnerOutput  — 执行模型 forward
+            sample_tokens(grammar_output)   → ModelRunnerOutput  — 采样 token
+            execute_dummy_batch()                                — 空 batch 预热
+            take_draft_token_ids()          → DraftTokenIds      — 获取 draft token
+            initialize_from_config(kv_cache_configs)              — 初始化 KV cache
+            compile_or_warm_up_model()                            — 编译/预热模型 + CUDA Graph capture
+        —— RPC 基座 ——
+            collective_rpc(method, ...) → list[Result] | Future   — (抽象) 向所有 Worker 广播调用
+        —— 生命周期 ——
+            shutdown()                                            — 关闭执行器
+            check_health()                                        — (抽象) 健康检查
+
+    === 核心成员属性 (由 __init__ 设置) ===
+        vllm_config: VllmConfig               — 总配置 (包含下面所有子 config)
+        model_config / cache_config / lora_config / load_config
+        parallel_config / scheduler_config / device_config
+        speculative_config / observability_config
+        is_sleeping: bool                     — 是否处于休眠状态 (sleep mode)
+        kv_output_aggregator                  — KV connector 的输出聚合器 (P/D 分离)
     """
 
     uses_ray: bool = False  # whether the executor uses Ray for orchestration.
     supports_pp: bool = False  # whether the executor supports PP
 
+    # 这是一个静态的工厂方法
     @staticmethod
     def get_class(vllm_config: VllmConfig) -> type["Executor"]:
         executor_class: type[Executor]
@@ -65,19 +99,20 @@ class Executor(ABC):
             else:
                 from vllm.v1.executor.ray_executor import RayDistributedExecutor
 
-                executor_class = RayDistributedExecutor
+                executor_class = RayDistributedExecutor # 多机多卡的执行器类
         elif distributed_executor_backend == "mp":
             from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 
-            executor_class = MultiprocExecutor
+            executor_class = MultiprocExecutor # 单机多卡的执行器类，负责：创建管理多个worker, collective_rpc广播通信
         elif distributed_executor_backend == "uni":
             from vllm.v1.executor.uniproc_executor import UniProcExecutor
 
-            executor_class = UniProcExecutor
+            executor_class = UniProcExecutor # 单机单卡的执行器类，无需多进程，无需IPC，最简单
         elif distributed_executor_backend == "external_launcher":
             # TODO: make v1 scheduling deterministic
-            # to support external launcher
-            executor_class = ExecutorWithExternalLauncher
+            # to support external launcher                # ray是自己管理，ray负责创建worker,跨节点管理
+                                                          # external_launcher是 torchrun， 这个是用来连接已经存在的worker的，由外部系统创建好worker了
+            executor_class = ExecutorWithExternalLauncher # vLLM 不负责启动 Worker 进程，而是交给外部启动器（例如 torchrun、Slurm）提前启动好
         elif isinstance(distributed_executor_backend, str):
             executor_class = resolve_obj_by_qualname(distributed_executor_backend)
             if not issubclass(executor_class, Executor):
@@ -218,7 +253,7 @@ class Executor(ABC):
     ) -> Future[ModelRunnerOutput | None]:
         pass
 
-    def execute_model(
+    def `execute_model`(
         self, scheduler_output: SchedulerOutput, non_block: bool = False
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
         output = self.collective_rpc(  # type: ignore[call-overload]

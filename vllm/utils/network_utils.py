@@ -48,7 +48,7 @@ def get_ip() -> str:
     # try ipv4
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
+            s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable  # 利用udp无连接，但是内核必定返回本机ip的技巧，来获取本机的ip
             return s.getsockname()[0]
     except Exception:
         pass
@@ -71,7 +71,7 @@ def get_ip() -> str:
     )
     return "0.0.0.0"
 
-
+# 测试这个本地回环的ip是否能够绑定socket使用
 def test_loopback_bind(address: str, family: int) -> bool:
     try:
         s = socket.socket(family, socket.SOCK_DGRAM)
@@ -81,7 +81,7 @@ def test_loopback_bind(address: str, family: int) -> bool:
     except OSError:
         return False
 
-
+# loopback_ip 是本地回环的ip
 def get_loopback_ip() -> str:
     loopback_ip = envs.VLLM_LOOPBACK_IP
     if loopback_ip:
@@ -90,7 +90,7 @@ def get_loopback_ip() -> str:
     # VLLM_LOOPBACK_IP is not set, try to get it based on network interface
 
     if test_loopback_bind("127.0.0.1", socket.AF_INET):
-        return "127.0.0.1"
+        return "127.0.0.1" 
     elif test_loopback_bind("::1", socket.AF_INET6):
         return "::1"
     else:
@@ -126,7 +126,7 @@ def join_host_port(host: str, port: int) -> str:
     else:
         return f"{host}:{port}"
 
-
+# 组成一个tcp通信的地址
 def get_distributed_init_method(ip: str, port: int) -> str:
     return get_tcp_uri(ip, port)
 
@@ -146,7 +146,7 @@ def get_open_zmq_ipc_path() -> str:
 def get_open_zmq_inproc_path() -> str:
     return f"inproc://{uuid4()}"
 
-
+#直接返回随机可用端口
 def get_open_port() -> int:
     """
     Get an open port for the vLLM process to listen on.

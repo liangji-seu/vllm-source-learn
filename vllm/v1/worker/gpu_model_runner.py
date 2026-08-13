@@ -459,10 +459,13 @@ class ExecuteModelState(NamedTuple):
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
 
-
+# 这个是modelrunner v1, 我们先看这个
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
+    '''
+    这个GPUModelRunner就是专门负责跑模型运行的了，也就是我们kuipa的demo,比如构建采样器啊，各个层算子的实例这些
+    '''
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -5288,6 +5291,13 @@ class GPUModelRunner(
             new_config = update_config(config, config_overrides)
             setattr(self, config_name, new_config)
 
+
+
+
+
+
+
+
     @instrument(span_name="Loading (GPU)")
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """
@@ -5305,22 +5315,24 @@ class GPUModelRunner(
             eplb_models = 0
 
         try:
-            with DeviceMemoryProfiler() as m:
+            with DeviceMemoryProfiler() as m: # 设备内存实际测试器
                 time_before_load = time.perf_counter()
                 if load_dummy_weights:
                     self.load_config.load_format = "dummy"
-                model_loader = get_model_loader(self.load_config)
-                self.model = model_loader.load_model(
+                model_loader = get_model_loader(self.load_config) # modelrunner里面构造一个model_loader 模型加载器
+                self.model = model_loader.load_model( # 加载模型
                     vllm_config=self.vllm_config, model_config=self.model_config
                 )
                 if self.lora_config:
-                    self.model = self.load_lora_model(
+                    self.model = self.load_lora_model( # 加载lora微调模型
                         self.model, self.vllm_config, self.device
                     )
+
+                
                 if hasattr(self, "drafter"):
                     logger.info_once("Loading drafter model...")
                     if hasattr(self.drafter, "load_model"):
-                        self.drafter.load_model(self.model)
+                        self.drafter.load_model(self.model) # 加载草稿模型
                     if (
                         hasattr(self.drafter, "model")
                         and is_mixture_of_experts(self.drafter.model)
@@ -5391,12 +5403,15 @@ class GPUModelRunner(
             combined_msg = f"{msg} (original error: {e})"
             logger.error(combined_msg)
             raise e
+
+        
         logger.info_once(
             "Model loading took %s GiB memory and %.6f seconds",
             format_gib(self.model_memory_usage),
             time_after_load - time_before_load,
         )
 
+        # 多模态配置
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (
             supports_multimodal_pruning(self.get_model())
@@ -5427,10 +5442,13 @@ class GPUModelRunner(
             compilation_counter.stock_torch_compile_count += 1
             self.model.compile(fullgraph=True, backend=backend)
             return
+
+
         # for other compilation modes, cudagraph behavior is controlled by
         # CudagraphWrapper and CudagraphDispatcher of vllm.
 
         # wrap the model with full cudagraph wrapper if needed.
+        # 包装一层cudagraph模式
         cudagraph_mode = self.compilation_config.cudagraph_mode
         assert cudagraph_mode is not None
         if (
@@ -5448,7 +5466,7 @@ class GPUModelRunner(
             cudagraph_mode.has_full_cudagraphs()
             and not self.parallel_config.use_ubatching
         ):
-            self.model = CUDAGraphWrapper(
+            self.model = CUDAGraphWrapper( # 在self.model外面包一层cudagraph包装器
                 self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
             )
         elif self.parallel_config.use_ubatching:
@@ -5462,6 +5480,19 @@ class GPUModelRunner(
                 )
 
         get_offloader().post_init()
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     def _setup_eagle3_aux_hidden_state_outputs(self) -> None:
         if not self.use_aux_hidden_state_outputs:

@@ -127,11 +127,11 @@ def _maybe_force_spawn():
     """Check if we need to force the use of the `spawn` multiprocessing start
     method.
     """
-    if os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") == "spawn":
+    if os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") == "spawn": # 如果已经是spawn了，就这样
         return
 
     reasons = []
-    if is_in_ray_actor():
+    if is_in_ray_actor(): # ray, 多机多卡
         # even if we choose to spawn, we need to pass the ray address
         # to the subprocess so that it knows how to connect to the ray cluster.
         # env vars are inherited by subprocesses, even if we use spawn.
@@ -150,7 +150,7 @@ def _maybe_force_spawn():
     elif xpu_is_initialized():
         reasons.append("XPU is initialized")
 
-    if in_wsl():
+    if in_wsl(): # 虚拟机
         reasons.append("WSL is detected and NVML is not compatible with fork")
 
     if reasons:
@@ -162,7 +162,7 @@ def _maybe_force_spawn():
             "for more information. Reasons: %s",
             "; ".join(reasons),
         )
-        os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+        os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn" # 强制改成spawn
 
 
 def get_mp_context():

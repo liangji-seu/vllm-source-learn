@@ -124,8 +124,9 @@ class AsyncIntermediateTensors(IntermediateTensors):
             object.__getattribute__(self, "wait_for_comm")()
         return object.__getattribute__(self, name)
 
-
+# 一个真正的GPU的worker类的实现
 class Worker(WorkerBase):
+    # 构造真正的Worker类，专门用来负责干活，和Executor是WorkerProc来负责的
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -172,7 +173,8 @@ class Worker(WorkerBase):
         if self.profiler_config.profiler not in ("torch", "cuda", None):
             raise ValueError(f"Unknown profiler type: {self.profiler_config.profiler}")
 
-        self.use_v2_model_runner = vllm_config.use_v2_model_runner
+        # 创建GPUModelRunner
+        self.use_v2_model_runner = vllm_config.use_v2_model_runner # 使用v2的modelrunner
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
 
@@ -303,10 +305,13 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Init device")
     def init_device(self):
+        # 【Worker 初始化 · 阶段 1/3】Init Device
+        #   初始化设备 + 分布式上下文(DP/TP/PP/EP 通信组) + 构造 model_runner(内含 InputBatch)
+        # 如果我们指定是用GPU来运行模型
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
-            parallel_config = self.parallel_config
+            parallel_config = self.parallel_config # 获取我们的并行化配置，TP，PP，PCP，EP,DP 的相关参数
             if (
                 parallel_config.distributed_executor_backend
                 not in ("ray", "external_launcher")
@@ -318,6 +323,7 @@ class Worker(WorkerBase):
                 if dp_local_rank is None:
                     dp_local_rank = self.parallel_config.data_parallel_index
 
+                # 按照配置计算所需GPU个数
                 tp_pp_world_size = (
                     self.parallel_config.pipeline_parallel_size
                     * self.parallel_config.tensor_parallel_size
@@ -328,11 +334,13 @@ class Worker(WorkerBase):
 
             # Publish the logical-to-physical mapping for topology queries
             # such as NIC affinity and P2P checks.
+            # assigned_physical_gpu_ids 是一张「逻辑 id → 物理卡」的映射表, 是本机节点运行用的物理GPU列表，按照下标和local_rank对应
+            # 逻辑id是self.local_rank
             assigned_physical_gpu_ids = parallel_config.assigned_physical_gpu_ids
             if assigned_physical_gpu_ids is not None:
                 from vllm.platforms.interface import set_assigned_physical_gpu_ids
 
-                set_assigned_physical_gpu_ids(assigned_physical_gpu_ids)
+                set_assigned_physical_gpu_ids(assigned_physical_gpu_ids) # 
                 assert self.local_rank < len(assigned_physical_gpu_ids), (
                     f"local_rank {self.local_rank} is out of bounds for "
                     f"assigned_physical_gpu_ids {assigned_physical_gpu_ids}"
@@ -362,18 +370,35 @@ class Worker(WorkerBase):
                     f"bounds for {torch.accelerator.device_count()} devices."
                 )
 
+
+            # visible_device_index 是「最终真正写给 PyTorch 的物理卡号」，作用就一个：决定 self.device 到底是哪张卡，并让 torch 把这张卡设成当前设备
             visible_device_index = (
                 current_platform.logical_device_id_to_visible_device_id(self.local_rank)
             )
-            self.device = torch.device(f"cuda:{visible_device_index}")
-            torch.accelerator.set_device_index(self.device)
+            self.device = torch.device(f"cuda:{visible_device_index}") # 记录下本进程的gpu设备
+            '''
+            torch.accelerator 是 PyTorch 新出的设备无关 API，等价于老式的 torch.cuda.set_device()，
+            但能自动适配 CUDA / ROCm(AMD) / XPU(Intel) / HPU 等不同后端。
+
+            vLLM 要支持多种硬件，所以不用 torch.cuda 这种绑死 NVIDIA 的写法，统一走 torch.accelerator 这个抽象层。
+            你在前面 else 分支里也看到了 torch.accelerator.device_count()（366 行），同理——它不是「又一个 accelerator」，而是同一套抽象 API 在干不同的事  
+            '''
+            torch.accelerator.set_device_index(self.device) # 开始把本进程的torch的cuda设备绑定好
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
+
+
+
+
+
+
+
 
             # Initialize the distributed environment BEFORE taking
             # memory snapshot
             # This ensures NCCL buffers are allocated before we measure
             # available memory
+            # 拉起NCCL通信网络，这是一个包装器，做点切分TP/PP/CP分组这些
             init_worker_distributed_environment(
                 self.vllm_config,
                 self.rank,
@@ -382,31 +407,58 @@ class Worker(WorkerBase):
                 current_platform.dist_backend,
             )
 
+
+
+
+
             if self.use_v2_model_runner:
                 logger.info_once("Using V2 Model Runner")
 
             # Set random seed.
+            # 设置随机种子，因为 vLLM 的代码里会用到好几套随机数来源（Python 的 random、numpy、torch、以及 GPU 上的 CUDA 随机），
+            # 所以要把它们全部设成同一个 seed，才能保证「整条推理链是确定性的」
             set_random_seed(self.model_config.seed)
 
             # Now take memory snapshot after NCCL is initialized
+                    # 清理python层面的垃圾内存
             gc.collect()
+
+                    # 清理pytorch的显存缓存
             torch.accelerator.empty_cache()
 
             # take current memory snapshot
-            self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
-            self.requested_memory = request_memory(init_snapshot, self.cache_config)
+            self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device) # 测量还有多少显存
+            # 这个就是用户设置显存使用比例的地方
+            self.requested_memory = request_memory(init_snapshot, self.cache_config)# 计算显存预算，总显存 × 利用率，算出一个「我打算用多少显存」的目标值（预算）
             logger.debug("worker init memory snapshot: %r", self.init_snapshot)
             logger.debug(
                 "worker requested memory: %sGiB", format_gib(self.requested_memory)
             )
+
+        # 不是GPU，直接报错
         else:
             raise RuntimeError(f"Unsupported device type: {self.device_config.device}")
 
         # Initialize workspace manager
+        '''
+        这是工作区（workspace）缓冲区的管理器初始化——就是给各种自定义 CUDA kernel 准备「草稿纸」用的临时显存池
+
+        这个workspace就是自定义算子所需要的 存放中间临时变量 的显存空间 的管理器，类似kvcachemanager的作用，不够比较简单
+        1. 管理临时scratch的缓冲
+        2. 没有语义，纯粹是草稿纸
+        3. 生命周期端，一次kernel调用内借，用完还
+        4. 没有分配表
+        5. 复用逻辑，不够就继续扩容
+        6. 并发隔离，靠每个ubatch槽位一份，避免并发互踩
+        '''
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
         init_workspace_manager(self.device, num_ubatches)
 
+
+
+
         # Construct the model runner
+        # Worker 已经准备好了环境，开始第二步，构造model_runner，开始准备着手处理模型了 ！！！！
         if self.use_v2_model_runner:
             from vllm.v1.worker.gpu.model_runner import (
                 GPUModelRunner as GPUModelRunnerV2,
@@ -421,6 +473,7 @@ class Worker(WorkerBase):
                 GPUModelRunner as GPUModelRunnerV1,
             )
 
+            # Worker构造modelrunner v1实例
             self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
 
         if self.rank == 0:
@@ -434,21 +487,53 @@ class Worker(WorkerBase):
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
-        with (
-            self._maybe_get_memory_pool_context(tag="weights"),
-            set_current_vllm_config(self.vllm_config),
-            # 20 MiB is the minimum PyTorch allows for max_split_size_mb.
-            self._scoped_allocator_max_split(max_split_size_mb=20),
-        ):
-            self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+        # 【Worker 初始化 · 阶段 2/3】Load Model
+        #   构造模型结构 + 加载权重(按 TP/PP 切分与设备放置) + model.eval()
+        #   + 可选 torch.compile / CUDA graph 包装
+        '''
+        真正把模型权重加载到GPU上的方法
 
+        核心就一句 self.model_runner.load_model(...)，外面包了三层 with 上下文管理器做「加载环境准备」，后面再补一段 weight transfer（多机权重搬运）的可选逻辑
+        '''
+        with (
+            self._maybe_get_memory_pool_context(tag="weights"), # 内存池,仅CuMem分配器，普通cuda用户为空
+
+                '''
+                把 vllm_config 设成「当前线程的 config」（thread-local 上下文）。
+                因为 load_model 内部很深的地方（比如各 model 的 load_weights 实现）可能通过 get_current_vllm_config() 来取配置，这层保证取得到
+                '''
+            set_current_vllm_config(self.vllm_config),          # 把config设置成当前的config
+
+
+            '''
+                这是三者里唯一「对普通用户也真的做点事」的。它临时把 PyTorch CUDA 分配器的 max_split_size_mb 调成 20 MiB：
+
+                为什么：加载权重时会申请很多大块、大小不一的显存，默认分配器容易产生碎片（内存碎成小块浪费掉）
+                调成 20MiB = 让分配器更细地切分，减少碎片，代价是多几次 cudaMalloc（权重加载是一次性的，无所谓）
+                退出 with 后 finally 里恢复原值（302-304 行）
+            '''
+            # 20 MiB is the minimum PyTorch allows for max_split_size_mb.
+            self._scoped_allocator_max_split(max_split_size_mb=20),# ③ 临时调 allocator 参数
+        ):
+            self.model_runner.load_model(load_dummy_weights=load_dummy_weights) # 真正加载权重
+
+        # 多机权重转移的逻辑
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
                 self.vllm_config.weight_transfer_config,
                 self.vllm_config,
                 self.device,
-                self.model_runner.get_model(),
+                self.model_runner.get_model(), 
             )
+
+
+
+
+
+
+
+
+
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
@@ -1354,6 +1439,15 @@ class Worker(WorkerBase):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)
 
 
+
+
+
+
+
+
+
+
+
 def init_worker_distributed_environment(
     vllm_config: VllmConfig,
     rank: int,
@@ -1361,7 +1455,19 @@ def init_worker_distributed_environment(
     local_rank: int = -1,
     backend: str = "nccl",
 ) -> None:
-    """Initialize the distributed environment."""
+    """Initialize the distributed environment.
+
+
+        它是个「包装层」，在做真正的建群之前先做几个前置动作：
+
+        init_batch_invariance() — 初始化 batch-invariant 机制（和 CUDA graph 重放相关）
+        override_envs_for_eplb(...) — MoE 的 EPLB 负载均衡环境变量
+        set_custom_all_reduce(not disable_custom_all_reduce) — 决定是否用 vLLM 自研的 all-reduce kernel 替代 NCCL 原生的（省开销）
+        init_distributed_environment(...) → 真正调 torch.distributed.init_process_group(backend="nccl") ← 核心
+        ensure_model_parallel_initialized(...) → 在 world group 之上再切 TP/PP/CP 子组
+
+    
+    """
     parallel_config = vllm_config.parallel_config
     from vllm.model_executor.layers.batch_invariant import init_batch_invariance
 
@@ -1378,12 +1484,13 @@ def init_worker_distributed_environment(
     if parallel_config.distributed_timeout_seconds is not None:
         timeout = timedelta(seconds=parallel_config.distributed_timeout_seconds)
 
+    # 构造卡的通信网络
     init_distributed_environment(
-        parallel_config.world_size,
-        rank,
-        init_method,
-        local_rank,
-        backend,
+        parallel_config.world_size, # 并行配置
+        rank, # 全局id
+        init_method,# 就是每个worker的zmq的url
+        local_rank,# 机内id
+        backend, # 选择比如nccl还是自己的all-reduce kernel
         timeout,
     )
 

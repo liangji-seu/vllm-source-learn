@@ -422,9 +422,11 @@ def request_memory(init_snapshot: MemorySnapshot, cache_config: CacheConfig) -> 
     """
     Calculate the amount of memory required by vLLM, then validate
     that the current amount of free memory is sufficient for that.
+
+    计算vllm需要的显存大小，然后评估目前的空闲显存是否足够
     """
     requested_memory = math.ceil(
-        init_snapshot.total_memory * cache_config.gpu_memory_utilization
+        init_snapshot.total_memory * cache_config.gpu_memory_utilization # 这个是用户配置的显存使用比例
     )
 
     if init_snapshot.free_memory < requested_memory:

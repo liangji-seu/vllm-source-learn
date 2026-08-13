@@ -35,7 +35,7 @@ class CompilationTimes(NamedTuple):
     language_model: float
     encoder: float
 
-
+# 定义一个worker类该有的接口
 class WorkerBase:
     """Worker interface that allows vLLM to cleanly separate implementations for
     different hardware. Also abstracts control plane communication, e.g., to
@@ -248,7 +248,7 @@ class WorkerWrapperBase:
 
         parallel_config = vllm_config.parallel_config
         if isinstance(parallel_config.worker_cls, str):
-            worker_class: type[WorkerBase] = resolve_obj_by_qualname(
+            worker_class: type[WorkerBase] = resolve_obj_by_qualname( # 解析出真正的Worker子类
                 parallel_config.worker_cls
             )
         else:
@@ -316,7 +316,7 @@ class WorkerWrapperBase:
 
         with set_current_vllm_config(self.vllm_config):
             # To make vLLM config available during worker initialization
-            self.worker = worker_class(**kwargs)
+            self.worker = worker_class(**kwargs) # 在这里构建的Worker子类的实例
 
     def initialize_from_config(self, kv_cache_configs: list[Any]) -> None:
         kv_cache_config = kv_cache_configs[self.global_rank]

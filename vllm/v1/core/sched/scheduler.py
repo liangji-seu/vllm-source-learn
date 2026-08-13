@@ -2328,7 +2328,9 @@ class Scheduler(SchedulerInterface):
         return GrammarOutput(structured_output_request_ids, bitmask)
 
 
-    # 核销调度器的状态
+    # 核销调度器的状态， 把 模型算出来的token收回来，落回到每个req上，然后决定谁该结束的一步
+    # 收结果 + 销账 + 判定停止
+    # （异步调度 + KV connector + 多模态 + 结构化输出 + 投机解码 + perf metrics + DP）这些是附加的优化
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -2393,6 +2395,8 @@ class Scheduler(SchedulerInterface):
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
         # to avoid expensive operations inside the loop.
+
+        # 核销 in-flight 计数
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
@@ -2423,6 +2427,7 @@ class Scheduler(SchedulerInterface):
             if output_is_stale and request.drop_stale_output:
                 continue
 
+            #得到本step新产出的token
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
@@ -2470,6 +2475,7 @@ class Scheduler(SchedulerInterface):
             num_output_tokens_before = len(request._output_token_ids)
 
             # Check for stop and update request status.
+            # 追加token + 判定停止
             if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids, is_stale=output_is_stale
@@ -2487,7 +2493,7 @@ class Scheduler(SchedulerInterface):
                 # whole prompt is consumed. Encoder inputs are never scheduled
                 # past a multi-modal item the encoder cache could not admit, so
                 # a consumed prompt also means every item in it was encoded.
-                request.status = RequestStatus.FINISHED_STOPPED
+                request.status = RequestStatus.FINISHED_STOPPED # 判定停止
                 stopped = True
 
             if new_token_ids and self.structured_output_manager.should_advance(
@@ -2596,7 +2602,7 @@ class Scheduler(SchedulerInterface):
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if should_emit_output:
-                # Add EngineCoreOutput for this Request.
+                # Add EngineCoreOutput for this Request. # 构造EngineCoreOutput 交给上层（引擎、客户端）
                 outputs[request.client_index].append(
                     EngineCoreOutput(
                         request_id=req_id,

@@ -219,7 +219,7 @@ def available_cpu_count() -> int:
 # set by the user, so a worker knows it may drop the value once startup is done.
 OMP_NUM_THREADS_SET_BY_VLLM = "VLLM_OMP_NUM_THREADS_SET_BY_VLLM"
 
-
+# 计算多进程里面的一个worker进程，需要多少线程
 def startup_omp_num_threads(num_local_procs: int) -> int:
     """Thread count for a worker process's startup work (weight loading).
 
@@ -229,6 +229,9 @@ def startup_omp_num_threads(num_local_procs: int) -> int:
     scheduling affinity and any cgroup CPU quota, and doesn't account for the
     other workers sharing the node.
     """
+    # 找到对当前进程真正可用的CPU核数，而不是物理机总数,
+    #  所谓可用的核心数， 就是物理核心数 - 容器限制的核心数 - 操作系统分配的cpu亲和性的核心数 后剩下的可以分配的核心数
+    # //整除， 就可以把CPU的核心均匀分给本机上的每一个worker进程，每个进程分几个核心就用几个OpenMP线程，最少保证一个（所以简单理解：核心数 = 线程数）
     return max(1, available_cpu_count() // max(1, num_local_procs))
 
 

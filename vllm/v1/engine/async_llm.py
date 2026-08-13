@@ -313,7 +313,7 @@ class AsyncLLM(EngineClient):
         # Create the LLMEngine.
         return cls(
             vllm_config=vllm_config,
-            executor_class=Executor.get_class(vllm_config),
+            executor_class=Executor.get_class(vllm_config), # 从vllm_config里面实际看看我们需要启动什么执行器
             start_engine_loop=start_engine_loop,
             stat_loggers=stat_loggers,
             log_requests=enable_log_requests,

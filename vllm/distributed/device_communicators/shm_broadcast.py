@@ -450,16 +450,14 @@ def _reduce_tensor(tensor: torch.Tensor):
     # Fall back to torch's default (copying) reduction.
     return tensor.__reduce_ex__(pickle.HIGHEST_PROTOCOL)
 
-
 @dataclass
 class Handle:
-    local_reader_ranks: list[int] = field(default_factory=list)
-
-    buffer_handle: tuple[int, int, int, str] | None = None
-    local_subscribe_addr: str | None = None
-    local_notify_addr: str | None = None
-    remote_subscribe_addr: str | None = None
-    remote_addr_ipv6: bool = False
+    local_reader_ranks: list[int] = field(default_factory=list)  # 哪些 rank 走本地共享内存读取（同机 Worker）
+    buffer_handle: tuple[int, int, int, str] | None = None       # 共享内存描述符 (shm_fd, size, chunk_bytes, name)，子进程 mmap 映射
+    local_subscribe_addr: str | None = None                      # 本机 ZMQ SUB 地址，子进程连接接收"新数据到了"通知
+    local_notify_addr: str | None = None                         # 本机 SpinCondition 通知地址，轻量跨进程唤醒
+    remote_subscribe_addr: str | None = None                     # 跨节点远程 DP 的 ZMQ SUB 订阅地址
+    remote_addr_ipv6: bool = False                               # 远程地址是否 IPv6
 
 
 class MessageQueue:
