@@ -61,29 +61,45 @@ ThinkingTokenBudget = Annotated[
 ]
 
 
+# ------【核心逻辑】SamplingType：采样策略枚举，决定采样器走贪心/随机/带种子随机路径 ------
 class SamplingType(IntEnum):
+    # ------【核心逻辑】GREEDY：贪心采样，取概率最高 token（argmax），输出确定 ------
     GREEDY = 0
+    # ------【核心逻辑】RANDOM：随机采样，按概率分布抽取，输出多样 ------
     RANDOM = 1
+    # ------【核心逻辑】RANDOM_SEED：带种子随机采样，结果可复现，便于对比实验 ------
     RANDOM_SEED = 2
 
 
 # maybe make msgspec?
+# ------【结构化输出/grammar】StructuredOutputsParams：结构化输出约束 DTO，构造约束解码 logit processor ------
 @dataclass
 class StructuredOutputsParams:
     # One of these fields will be used to build a logit processor.
+    # ------【结构化输出/grammar】json：JSON Schema 约束（str/dict），约束解码产出合法 JSON ------
     json: str | dict | None = None
+    # ------【结构化输出/grammar】regex：正则表达式约束，生成文本需匹配该正则 ------
     regex: str | None = None
+    # ------【结构化输出/grammar】choice：候选字符串列表约束，输出只能取自给定选项 ------
     choice: list[str] | None = None
+    # ------【结构化输出/grammar】grammar：GBNF 等文法约束，按文法规则约束解码 ------
     grammar: str | None = None
+    # ------【结构化输出/grammar】json_object：仅强制输出 JSON 对象，不校验具体 schema ------
     json_object: bool | None = None
     # These are other options that can be set.
+    # ------【结构化输出/grammar】disable_any_whitespace：禁用任意空白符，收紧 JSON 匹配 ------
     disable_any_whitespace: bool = False
+    # ------【结构化输出/grammar】disable_additional_properties：禁止 schema 之外的额外属性 ------
     disable_additional_properties: bool = False
+    # ------【结构化输出/grammar】whitespace_pattern：自定义空白匹配模式，替代默认空白定义 ------
     whitespace_pattern: str | None = None
+    # ------【结构化输出/grammar】structural_tag：结构化标签，约束 JSON 推理类 token ------
     structural_tag: str | None = None
 
+    # ------【结构化输出/grammar】_backend：约束解码后端（xgrammar/outlines），Processor 校验时填入 ------
     _backend: str | None = field(default=None, init=False)
     """CAUTION: Should only be set by Processor._validate_structured_output"""
+    # ------【结构化输出/grammar】_backend_was_auto：后端是否自动选择，用于回退/报错 ------
     _backend_was_auto: bool = field(default=False, init=False)
     """CAUTION: Should only be set by Processor._validate_structured_output"""
 
@@ -142,19 +158,23 @@ class StructuredOutputsParams:
         )
 
 
+# ------【核心逻辑】RepetitionDetectionParams：重复惩罚/检测参数 DTO，检测输出中重复 N-gram 模式 ------
 @dataclass
 class RepetitionDetectionParams:
     """Parameters for detecting repetitive N-gram patterns in output tokens."""
 
+    # ------【核心逻辑】max_pattern_size：检测的最大 N-gram 长度，0 表示禁用重复检测 ------
     max_pattern_size: int = 0
     """Maximum size of N-gram pattern to detect for sequence repetition.
     Set to 0 to disable. Must be used together with min_count."""
 
+    # ------【核心逻辑】min_pattern_size：检测的最小 N-gram 长度，0 时默认取 1 ------
     min_pattern_size: int = 0
     """Minimum N-gram pattern size to check for sequence repetition.
     If set to 0, it defaults to 1.
     Must be <= max_pattern_size."""
 
+    # ------【核心逻辑】min_count：N-gram 重复触发检测的最小次数，须 >= 2 ------
     min_count: int = 0
     """Minimum number of times an N-gram pattern must repeat to trigger
     detection. Must be >= 2. Example: 3 for detecting a phrase repeated
@@ -179,12 +199,16 @@ class RepetitionDetectionParams:
             )
 
 
+# ------【核心逻辑】RequestOutputKind：输出返回模式枚举，决定 RequestOutput 返回全量/增量/仅最终结果 ------
 class RequestOutputKind(Enum):
     # Return entire output so far in every RequestOutput
+    # ------【核心逻辑】CUMULATIVE：每次 RequestOutput 返回完整累计输出 ------
     CUMULATIVE = 0
     # Return only deltas in each RequestOutput
+    # ------【核心逻辑】DELTA：每次只返回增量 delta，减少传输量 ------
     DELTA = 1
     # Do not return intermediate RequestOutput
+    # ------【核心逻辑】FINAL_ONLY：仅返回最终结果，不返回中间结果 ------
     FINAL_ONLY = 2
 
 
@@ -196,6 +220,7 @@ def _get_llg_tokenizer(tokenizer: TokenizerLike) -> Any:
     return tokenizer.llg_tokenizer if is_mistral_tokenizer(tokenizer) else None
 
 
+# ------【核心逻辑】SamplingParams：采样参数消息 DTO，API/引擎→调度器与采样器传递采样配置，涉及前缀缓存/投机解码/结构化输出等优化 ------
 class SamplingParams(
     PydanticMsgspecMixin,
     msgspec.Struct,
@@ -210,6 +235,7 @@ class SamplingParams(
     In addition, we support beam search, which is not supported by OpenAI.
     """
 
+    # ------【核心逻辑】n：单请求返回的序列数量，受 VLLM_MAX_N_SEQUENCES 限制，n>1 触发多序列并行生成 ------
     n: int = 1
     """Number of outputs to return for the given prompt request.
 
@@ -221,49 +247,63 @@ class SamplingParams(
         are generated and streamed cumulatively per request. To see all `n`
         outputs upon completion, use `output_kind=RequestOutputKind.FINAL_ONLY`
         in `SamplingParams`."""
+    # ------【核心逻辑】presence_penalty：存在惩罚，>0 鼓励用新 token，作用于 logit 处理器 ------
     presence_penalty: float = 0.0
     """Penalizes new tokens based on whether they appear in the generated text
     so far. Values > 0 encourage the model to use new tokens, while values < 0
     encourage the model to repeat tokens."""
+    # ------【核心逻辑】frequency_penalty：频率惩罚，按已生成 token 出现频次调低 logit ------
     frequency_penalty: float = 0.0
     """Penalizes new tokens based on their frequency in the generated text so
     far. Values > 0 encourage the model to use new tokens, while values < 0
     encourage the model to repeat tokens."""
+    # ------【核心逻辑】repetition_penalty：重复惩罚，惩罚 prompt+已生成文本中出现的 token ------
     repetition_penalty: float = 1.0
     """Penalizes new tokens based on whether they appear in the prompt and the
     generated text so far. Values > 1 encourage the model to use new tokens,
     while values < 1 encourage the model to repeat tokens."""
+    # ------【核心逻辑】temperature：采样温度，越低越确定，0 表示贪心采样 ------
     temperature: float = 1.0
     """Controls the randomness of the sampling. Lower values make the model
     more deterministic, while higher values make the model more random. Zero
     means greedy sampling."""
+    # ------【核心逻辑】top_p：核采样累计概率阈值，取累计概率达 top_p 的 token 集合 ------
     top_p: float = 1.0
     """Controls the cumulative probability of the top tokens to consider. Must
     be in (0, 1]. Set to 1 to consider all tokens."""
+    # ------【核心逻辑】top_k：只保留概率最高的 k 个 token，0/-1 表示不限制 ------
     top_k: int = 0
     """Controls the number of top tokens to consider. Set to 0 (or -1) to
     consider all tokens."""
+    # ------【核心逻辑】min_p：相对最高概率的最小概率门槛，低于该比值的 token 被过滤 ------
     min_p: float = 0.0
     """Represents the minimum probability for a token to be considered,
     relative to the probability of the most likely token. Must be in [0, 1].
     Set to 0 to disable this."""
+    # ------【核心逻辑】seed：随机种子，固定后采样结果可复现，-1 转 None ------
     seed: int | None = None
     """Random seed to use for the generation."""
+    # ------【核心逻辑】stop：停止字符串列表，命中即终止生成并截断输出 ------
     stop: str | list[str] | None = None
     """String(s) that stop the generation when they are generated. The returned
     output will not contain the stop strings."""
+    # ------【核心逻辑】stop_token_ids：停止 token id 列表，命中即终止生成 ------
     stop_token_ids: list[int] | None = None
     """Token IDs that stop the generation when they are generated. The returned
     output will contain the stop tokens unless the stop tokens are special
     tokens."""
+    # ------【核心逻辑】ignore_eos：是否忽略 EOS token 继续生成 ------
     ignore_eos: bool = False
     """Whether to ignore the EOS token and continue generating
     tokens after the EOS token is generated."""
+    # ------【核心逻辑/显存 profiling】max_tokens：每序列最大生成 token 数，供调度器预估 KV 与输出长度 ------
     max_tokens: int | None = 16
     """Maximum number of tokens to generate per output sequence."""
+    # ------【核心逻辑】min_tokens：EOS/stop 前至少生成的 token 数 ------
     min_tokens: int = 0
     """Minimum number of tokens to generate per output sequence before EOS or
     `stop_token_ids` can be generated"""
+    # ------【核心逻辑】logprobs：每输出 token 返回的 log 概率数，-1 返回全词表 ------
     logprobs: int | None = None
     """Number of log probabilities to return per output token. When set to
     `None`, no probability is returned. If set to a non-`None` value, the
@@ -272,15 +312,18 @@ class SamplingParams(
     follows the OpenAI API: The API will always return the log probability of
     the sampled token, so there may be up to `logprobs+1` elements in the
     response. When set to -1, return all `vocab_size` log probabilities."""
+    # ------【核心逻辑】prompt_logprobs：每 prompt token 返回的 log 概率数，-1 返回全词表 ------
     prompt_logprobs: int | None = None
     """Number of log probabilities to return per prompt token.
     When set to -1, return all `vocab_size` log probabilities."""
+    # ------【核心逻辑】logprob_token_ids：只对指定 token id 返回 logprobs，比 -1 更省显存/计算 ------
     logprob_token_ids: list[int] | None = None
     """Specific token IDs to return logprobs for. More efficient than
     logprobs=-1 when you only need logprobs for a small set of tokens.
     When set, logprobs for exactly these token IDs will be returned,
     in addition to the sampled token. This is useful for scoring tasks
     where you want to compare probabilities of specific label tokens."""
+    # ------【核心逻辑/显存 profiling】flat_logprobs：扁平结构返回 logprobs，降低 GC 开销提升性能 ------
     flat_logprobs: bool = False
     """Whether to return logprobs in flatten format (i.e. FlatLogprob)
     for better performance.
@@ -290,20 +333,27 @@ class SamplingParams(
     # NOTE: This parameter is only exposed at the engine level for now.
     # It is not exposed in the OpenAI API server, as the OpenAI API does
     # not support returning only a list of token IDs.
+    # ------【核心逻辑】detokenize：是否把 token id 解码回文本，仅引擎层暴露 ------
     detokenize: bool = True
     """Whether to detokenize the output."""
+    # ------【核心逻辑】skip_special_tokens：输出时是否跳过特殊 token ------
     skip_special_tokens: bool = True
     """Whether to skip special tokens in the output."""
+    # ------【核心逻辑】spaces_between_special_tokens：特殊 token 之间是否加空格 ------
     spaces_between_special_tokens: bool = True
     """Whether to add spaces between special tokens in the output."""
+    # ------【核心逻辑】include_stop_str_in_output：输出文本是否保留停止字符串 ------
     include_stop_str_in_output: bool = False
     """Whether to include the stop strings in output text."""
+    # ------【核心逻辑】output_kind：输出返回模式（累计/增量/仅最终），决定 RequestOutput 打包粒度 ------
     output_kind: RequestOutputKind = RequestOutputKind.CUMULATIVE
+    # ------【异步 RPC】stream_interval：流式输出聚合的 token 间隔，减少 RequestOutput 消息频率 ------
     stream_interval: int | None = None
     """Number of newly generated tokens to batch into each streamed
     `RequestOutput`. Raises the interval above the engine-level
     `--stream-interval`. Values below engine setting are clamped up to it.
     The first and final outputs are always emitted immediately."""
+    # ------【核心逻辑】skip_clone：为 True 时 clone 用浅拷贝省深拷贝开销（需独占实例） ------
     skip_clone: bool = False
     """Internal flag indicating that this SamplingParams instance is safe to
     reuse without cloning. When True, clone() will return self without
@@ -313,23 +363,31 @@ class SamplingParams(
 
     # The below fields are not supposed to be used as an input.
     # They are set in post_init.
+    # ------【核心逻辑】output_text_buffer_length：为停止字符串评估预留的回退字符数 ------
     output_text_buffer_length: int = 0
+    # ------【核心逻辑】_eos_token_id：内部 EOS token id，由引擎填充，供终止判断 ------
     _eos_token_id: int | None = None
+    # ------【核心逻辑】_all_stop_token_ids：全部停止 token id 集合，post_init 聚合，供终止判断 ------
     _all_stop_token_ids: set[int] = msgspec.field(default_factory=set)
 
     # Fields used to construct logits processors
+    # ------【结构化输出/grammar】structured_outputs：结构化输出约束，构造约束解码 logit processor ------
     structured_outputs: StructuredOutputsParams | None = None
     """Parameters for configuring structured outputs."""
+    # ------【核心逻辑】logit_bias：token→偏置映射，构造 logit 偏置处理器调整分数 ------
     logit_bias: dict[int, float] | None = None
     """If provided, the engine will construct a logits processor that applies
     these logit biases."""
+    # ------【核心逻辑】allowed_token_ids：白名单 token id，只保留这些 token 的分数 ------
     allowed_token_ids: list[int] | None = None
     """If provided, the engine will construct a logits processor which only
     retains scores for the given token ids."""
+    # ------【核心逻辑】extra_args：透传给自定义采样实现/插件的额外参数 ------
     extra_args: dict[str, Any] | None = None
     """Arbitrary additional args, that can be used by custom sampling
     implementations, plugins, etc. Not used by any in-tree sampling
     implementations."""
+    # ------【EP/EPLB】routed_experts_prompt_start：返回路由专家数据时跳过前 N 个 prompt token，避免多轮重复 ------
     routed_experts_prompt_start: int = 0
     """When enable_return_routed_experts is active, skip the first
     routed_experts_prompt_start prompt tokens from the returned routing
@@ -339,16 +397,21 @@ class SamplingParams(
     tokens."""
 
     # Fields used for bad words
+    # ------【核心逻辑】bad_words：禁用词列表，其末 token 被禁止补全 ------
     bad_words: list[str] | None = None
     """Words that are not allowed to be generated. More precisely, only the
     last token of a corresponding token sequence is not allowed when the next
     generated token can complete the sequence."""
+    # ------【核心逻辑】_bad_words_token_ids：内部禁用词 token 序列，由 update_from_tokenizer 编码填入 ------
     _bad_words_token_ids: list[list[int]] | None = None
 
+    # ------【前缀缓存】skip_reading_prefix_cache：为 True 跳过读前缀缓存，需 prompt_logprobs 时自动置 True ------
     skip_reading_prefix_cache: bool | None = None
+    # ------【核心逻辑】thinking_token_budget：思考（推理）阶段最大 token 预算，-1 表示不限 ------
     thinking_token_budget: int | None = None
     """Maximum number of tokens allowed for thinking operations."""
 
+    # ------【核心逻辑】repetition_detection：重复 N-gram 检测参数，命中提前终止省 token ------
     repetition_detection: RepetitionDetectionParams | None = None
     """Parameters for detecting repetitive N-gram patterns in output tokens.
     If such repetition is detected, generation will be ended early. LLMs can
@@ -357,6 +420,7 @@ class SamplingParams(
     '\\emoji \\emoji \\emoji ...'). This feature can detect such behavior
     and terminate early, saving time and tokens."""
 
+    # ------【核心逻辑】from_optional：批量构造 SamplingParams，把 None 归一化为默认值并校验 logit_bias ------
     @staticmethod
     def from_optional(
         n: int | None = 1,
@@ -454,6 +518,7 @@ class SamplingParams(
             repetition_detection=repetition_detection,
         )
 
+    # ------【核心逻辑】__post_init__：归一化参数（温度下限/stop 列表化/logprobs True→1）并触发校验与聚合 ------
     def __post_init__(self) -> None:
         if 0 < self.temperature < _MAX_TEMP:
             logger.warning(
@@ -512,6 +577,7 @@ class SamplingParams(
             # we need to skip reading cache at this request.
             self.skip_reading_prefix_cache = self.prompt_logprobs is not None
 
+    # ------【核心逻辑】_verify_args：逐字段合法性校验，非法值抛 VLLMValidationError ------
     def _verify_args(self) -> None:
         if not isinstance(self.n, int):
             raise VLLMValidationError(
@@ -637,12 +703,14 @@ class SamplingParams(
                 f"Got bad_words={self.bad_words}"
             )
 
+    # ------【核心逻辑】_verify_greedy_sampling：贪心采样时校验 n 必须为 1 ------
     def _verify_greedy_sampling(self) -> None:
         if self.n > 1:
             raise VLLMValidationError(
                 f"n must be 1 when using greedy sampling, got {self.n}."
             )
 
+    # ------【核心逻辑】update_from_generation_config：用 generation_config 的 eos 等默认值回填参数，聚合停止 token ------
     def update_from_generation_config(
         self,
         generation_config: dict[str, Any],
@@ -673,6 +741,7 @@ class SamplingParams(
                     eos_ids.update(self.stop_token_ids)
                     self.stop_token_ids = list(eos_ids)
 
+    # ------【核心逻辑】update_from_tokenizer：把 bad_words 编码为 token id 序列（含前缀空格两种形式） ------
     def update_from_tokenizer(self, tokenizer: TokenizerLike) -> None:
         if not self.bad_words:
             return
@@ -714,6 +783,7 @@ class SamplingParams(
                 value=self.bad_words,
             )
 
+    # ------【核心逻辑】sampling_type：根据 temperature/seed 推导采样类型，缓存避免重复计算 ------
     @cached_property
     def sampling_type(self) -> SamplingType:
         if self.temperature < _SAMPLING_EPS:
@@ -735,6 +805,7 @@ class SamplingParams(
         # For internal use only. Backward compatibility not guaranteed
         return self._bad_words_token_ids
 
+    # ------【核心逻辑】num_logprobs：实际返回的 sample logprobs 数，计入 logprob_token_ids ------
     @property
     def num_logprobs(self) -> int | None:
         """Number of sample logprobs to return per output token, or `None` if
@@ -745,6 +816,7 @@ class SamplingParams(
             return self.logprobs
         return len(self.logprob_token_ids) if self.logprob_token_ids else None
 
+    # ------【核心逻辑】clone：skip_clone 时浅拷贝否则深拷贝，控制请求级副本开销 ------
     def clone(self) -> "SamplingParams":
         """If skip_clone is True, uses shallow copy instead of deep copy."""
         if self.skip_clone:
@@ -752,6 +824,7 @@ class SamplingParams(
 
         return copy.deepcopy(self)
 
+    # ------【核心逻辑】verify：结合 model/投机/结构化输出配置做引擎级参数校验入口 ------
     def verify(
         self,
         model_config: ModelConfig,
@@ -769,6 +842,7 @@ class SamplingParams(
             model_config, structured_outputs_config, tokenizer
         )
 
+    # ------【核心逻辑】_validate_logprobs：校验 logprobs 不超模型 max_logprobs 上限 ------
     def _validate_logprobs(self, model_config: ModelConfig) -> None:
         max_logprobs = model_config.max_logprobs
         if max_logprobs == -1:
@@ -831,6 +905,7 @@ class SamplingParams(
                     value=num_prompt_logprobs,
                 )
 
+    # ------【核心逻辑】_validate_logit_bias：校验 logit_bias token id 在词表范围内 ------
     def _validate_logit_bias(self, model_config: ModelConfig) -> None:
         """Validate logit_bias token IDs are within vocabulary range."""
         if not self.logit_bias:
@@ -851,6 +926,7 @@ class SamplingParams(
                 value=invalid_token_ids,
             )
 
+    # ------【核心逻辑】_validate_logits_processors：委托校验自定义 logits processor 参数 ------
     def _validate_logits_processors(self, model_config: ModelConfig) -> None:
         from vllm.v1.sample.logits_processor import (
             validate_logits_processors_parameters,
@@ -858,6 +934,7 @@ class SamplingParams(
 
         validate_logits_processors_parameters(model_config.logits_processors, self)
 
+    # ------【核心逻辑】_validate_allowed_token_ids：校验 allowed_token_ids 非空且在词表内 ------
     def _validate_allowed_token_ids(self, tokenizer: TokenizerLike | None) -> None:
         allowed_token_ids = self.allowed_token_ids
         if allowed_token_ids is None:
@@ -884,6 +961,7 @@ class SamplingParams(
                     value=invalid_token_ids,
                 )
 
+    # ------【投机解码】_validate_spec_decode：校验参数与投机解码兼容性（min_p/logit_bias 暂不支持） ------
     def _validate_spec_decode(
         self,
         speculative_config: SpeculativeConfig | None,
@@ -898,6 +976,7 @@ class SamplingParams(
                 "are not yet supported with speculative decoding."
             )
 
+    # ------【核心逻辑】_validate_diffusion：扩散模型不支持逐请求采样参数时抛错 ------
     def _validate_diffusion(self, model_config: ModelConfig) -> None:
         if not model_config.is_diffusion:
             return
@@ -920,6 +999,7 @@ class SamplingParams(
                 "are not yet supported with diffusion models."
             )
 
+    # ------【结构化输出/grammar】_validate_structured_outputs：选定/校验约束解码后端并按后端验证请求 ------
     def _validate_structured_outputs(
         self,
         model_config: ModelConfig,
@@ -1113,6 +1193,7 @@ class SamplingParams(
             f"extra_args={self.extra_args})"
         )
 
+    # ------【CUDA Graph】for_sampler_warmup：构造覆盖全采样分支的参数用于采样器预热/图捕获 ------
     @staticmethod
     def for_sampler_warmup() -> "SamplingParams":
         """Set parameters to exercise all sampler logic."""
@@ -1132,6 +1213,7 @@ class SamplingParams(
         )
 
 
+# ------【核心逻辑】BeamSearchParams：束搜索参数 DTO，配置 beam search 解码的束宽与长度惩罚 ------
 class BeamSearchParams(
     msgspec.Struct,
     omit_defaults=True,  # type: ignore[call-arg]
@@ -1140,10 +1222,17 @@ class BeamSearchParams(
 ):  # type: ignore[call-arg]
     """Beam search parameters for text generation."""
 
+    # ------【核心逻辑】beam_width：束宽，同时维护的候选序列数，越大搜索越广耗时越高 ------
     beam_width: int
+    # ------【核心逻辑】max_tokens：每个束序列最大生成 token 数 ------
     max_tokens: int
+    # ------【核心逻辑】ignore_eos：是否忽略 EOS token 继续生成 ------
     ignore_eos: bool = False
+    # ------【核心逻辑】temperature：采样温度，束搜索默认 0 走贪心打分 ------
     temperature: float = 0.0
+    # ------【核心逻辑】length_penalty：长度惩罚，>1 偏向长序列，<1 偏向短序列 ------
     length_penalty: float = 1.0
+    # ------【核心逻辑】include_stop_str_in_output：输出文本是否保留停止字符串 ------
     include_stop_str_in_output: bool = False
+    # ------【结构化输出/grammar】structured_outputs：结构化输出约束，构造约束解码 logit processor ------
     structured_outputs: StructuredOutputsParams | None = None

@@ -800,15 +800,23 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         )
 
 
+# ------【投机解码/显存 profiling】MambaSpec：Mamba 状态空间层的 KV cache spec，Worker 建模层产出→KV cache manager 规划显存 ------
 @dataclass(frozen=True)
 class MambaSpec(KVCacheSpec):
+    # ------【显存 profiling】shapes：各状态张量形状（conv 状态/ssm 状态），决定单页字节 ------
     shapes: tuple[tuple[int, ...], ...]
+    # ------【显存 profiling】dtypes：各状态张量 dtype，与 shapes 一一对应 ------
     dtypes: tuple[torch.dtype]
+    # ------【显存 profiling/对齐】page_size_padded：页字节对齐填充值，None 表示不填充 ------
     page_size_padded: int | None = None
+    # ------【核心逻辑】mamba_type：Mamba 后端类型（MAMBA2/MAMBA1），决定状态布局与 kernel 分发 ------
     mamba_type: MambaAttentionBackendEnum = MambaAttentionBackendEnum.MAMBA2
+    # ------【显存 profiling】mamba_cache_mode：状态缓存模式 all/align/none，控制状态常驻与块表行长度 ------
     mamba_cache_mode: str = "none"
+    # ------【投机解码】num_speculative_blocks：投机解码预留的状态块数 ------
     num_speculative_blocks: int = 0
 
+    # ------【显存 profiling】page_size_bytes：各状态张量字节求和；有填充用填充值 ------
     @property
     def page_size_bytes(self) -> int:
         page_size = sum(
@@ -820,6 +828,7 @@ class MambaSpec(KVCacheSpec):
             return self.page_size_padded
         return page_size
 
+    # ------【显存 profiling/投机解码】max_memory_usage_bytes：按缓存模式 all/align/none 算状态常驻字节，再加投机块 ------
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         if vllm_config.cache_config.mamba_cache_mode == "all":
             max_model_len = vllm_config.model_config.max_model_len
@@ -831,6 +840,7 @@ class MambaSpec(KVCacheSpec):
         else:
             return self.page_size_bytes * (1 + self.num_speculative_blocks)
 
+    # ------【显存 profiling/投机解码】max_num_blocks_per_req：块表行长度；align 模式按 max_len 覆盖，否则按常驻字节折算 ------
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
         # Mamba state is replicated across DCP/PCP ranks, never sharded, so
         # no CP scaling applies.
@@ -843,6 +853,7 @@ class MambaSpec(KVCacheSpec):
             return cdiv(max_len, self.block_size) + self.num_speculative_blocks
         return cdiv(self.max_memory_usage_bytes(vllm_config), self.page_size_bytes)
 
+    # ------【核心逻辑】is_uniform_with_collection：所有层须同为 MambaSpec 且投机块数一致 ------
     def is_uniform_with_collection(
         self, kv_cache_specs: dict[str, KVCacheSpec]
     ) -> bool:
@@ -853,19 +864,23 @@ class MambaSpec(KVCacheSpec):
         )
 
 
+# ------【核心逻辑/显存 profiling】EncoderOnlyAttentionSpec：仅编码器层 spec，不需要 KV cache，显存占用为 0 ------
 @dataclass(frozen=True)
 class EncoderOnlyAttentionSpec(AttentionSpec):
+    # ------【显存 profiling】max_memory_usage_bytes：编码器层无 KV cache，返回 0 ------
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         # Encoder-only layers do not need KV cache
         return 0
 
 
+# ------【核心逻辑/显存 profiling】CrossAttentionSpec：交叉注意力层 spec（encoder-decoder），缓存编码器状态 ------
 @dataclass(frozen=True)
 class CrossAttentionSpec(AttentionSpec):
     """
     KV cache spec for cross-attention layers in encoder-decoder models.
     """
 
+    # ------【显存 profiling】max_memory_usage_bytes：按最大编码器输入 token 数折算编码器状态常驻字节 ------
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         # For cross-attention, we need to cache encoder states
         # Get encoder length (e.g., 1500 for Whisper).
@@ -873,10 +888,13 @@ class CrossAttentionSpec(AttentionSpec):
         return cdiv(max_encoder_len, self.block_size) * self.page_size_bytes
 
 
+# ------【核心逻辑/显存 profiling】SinkFullAttentionSpec：带 sink token 的全注意力 spec（streaming/无限上下文），常驻开头 sink token 缓解注意力散焦 ------
 @dataclass(frozen=True)
 class SinkFullAttentionSpec(FullAttentionSpec):
+    # ------【核心逻辑】sink_len：常驻的 sink token 数，None 表示非 sink 模式 ------
     sink_len: int | None = None
 
+    # ------【核心逻辑】merge：合并 SinkFullAttentionSpec 列表，窗口/分块/非因果规则同 FullAttentionSpec ------
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
         """
@@ -927,6 +945,7 @@ class SinkFullAttentionSpec(FullAttentionSpec):
         return merged_spec
 
 
+# ------【核心逻辑/显存 profiling】UniformTypeKVCacheSpecs：同构多层 KV cache 打包 DTO，把 token 槽需求相同的多层合为一组统一分配 ------
 @dataclass(frozen=True)
 class UniformTypeKVCacheSpecs(KVCacheSpec):
     """
@@ -936,12 +955,15 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     and should not be merged into one UniformTypeKVCacheSpecs.
     """
 
+    # ------【核心逻辑】kv_cache_specs：层名→spec 映射，同组各层共享同一块表 ------
     kv_cache_specs: dict[str, KVCacheSpec]
 
+    # ------【显存 profiling】page_size_bytes：组内各层页字节求和（同组共享块表，按总量计） ------
     @property
     def page_size_bytes(self) -> int:
         return sum(spec.page_size_bytes for spec in self.kv_cache_specs.values())
 
+    # ------【显存 profiling】max_memory_usage_bytes：组内最大页数×总页字节，保证任一层的常驻需求被覆盖 ------
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_num_pages = max(
             cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)
@@ -949,6 +971,7 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         )
         return max_num_pages * self.page_size_bytes
 
+    # ------【核心逻辑/PD 分离】max_num_blocks_per_req：块表行长度须各层一致，否则抛错（避免 DCP 分片宽度不一致） ------
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
         # Metadata builders are constructed from the per-layer spec, so the base
         # cdiv(max_len, block_size) would drop its DCP sharding and size the
@@ -963,6 +986,7 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         )
         return next(iter(widths))
 
+    # ------【核心逻辑】is_uniform_type：所有层块大小一致且同构则视为同类型，可合并为一个 spec ------
     @classmethod
     def is_uniform_type(cls, kv_cache_specs: dict[str, KVCacheSpec]) -> bool:
         """
@@ -978,6 +1002,7 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         first_spec = next(iter(kv_cache_specs.values()))
         return first_spec.is_uniform_with_collection(kv_cache_specs)
 
+    # ------【核心逻辑】from_specs：同构则返回打包 spec，否则返回 None（退化回逐层 spec） ------
     @classmethod
     def from_specs(cls, kv_cache_specs: dict[str, KVCacheSpec]) -> Self | None:
         """
@@ -991,14 +1016,17 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             return None
 
     # NOTE: below util functions are only used by DeepseekV4 for now.
+    # ------【核心逻辑】get_page_sizes：返回组内去重后的页字节列表（DeepseekV4 专用） ------
     def get_page_sizes(self) -> list[int]:
         return list(set(spec.page_size_bytes for spec in self.kv_cache_specs.values()))
 
+    # ------【核心逻辑】get_num_layer_tuples：返回占多数的页字节对应的层数（DeepseekV4 专用） ------
     def get_num_layer_tuples(self) -> int:
         return Counter(
             spec.page_size_bytes for spec in self.kv_cache_specs.values()
         ).most_common(1)[0][1]
 
+    # ------【显存 profiling】max_memory_usage_pages：组内各层最大常驻页数（DeepseekV4 专用） ------
     def max_memory_usage_pages(self, vllm_config: VllmConfig) -> int:
         return max(
             cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)
@@ -1006,6 +1034,7 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         )
 
 
+# ------【核心逻辑】get_kv_cache_spec_kind：把 spec 映射为 KVCacheSpecKind 标签，供引擎按注意力类型分发 ------
 def get_kv_cache_spec_kind(kv_cache_spec: KVCacheSpec) -> KVCacheSpecKind:
     if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
         inner_kinds = {
@@ -1038,6 +1067,7 @@ def get_kv_cache_spec_kind(kv_cache_spec: KVCacheSpec) -> KVCacheSpecKind:
     return KVCacheSpecKind.UNKNOWN
 
 
+# ------【核心逻辑/滑动窗口】get_kv_cache_spec_sliding_window：提取 spec 的滑动窗口大小，混合窗口返回 None ------
 def get_kv_cache_spec_sliding_window(kv_cache_spec: KVCacheSpec) -> int | None:
     if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
         inner_windows = {
@@ -1050,18 +1080,24 @@ def get_kv_cache_spec_sliding_window(kv_cache_spec: KVCacheSpec) -> int | None:
     return None
 
 
+# ------【显存 profiling/TP】KVCacheTensor：Engine→Worker 的 KV cache 张量初始化规格 DTO，经 executor 下发，描述每层张量布局 ------
 @dataclass
 class KVCacheTensor:
     """
     A class for specifying how the workers should initialize the KV cache.
     """
 
+    # ------【显存 profiling】size：该 KV cache 张量字节数 ------
     size: int  # size of the KV cache tensor in bytes
+    # ------【显存 profiling】shared_by：共享同一张量的层名列表（跨层复用显存） ------
     shared_by: list[str]  # layer names that share the same KV cache tensor
+    # ------【显存 profiling/对齐】offset：该层在连续块中的字节偏移 ------
     offset: int = 0  # byte offset of this layer within a contiguous block
+    # ------【显存 profiling/打包布局】block_stride：打包布局下每块总字节数（0=非打包） ------
     block_stride: int = 0  # total bytes per block in a packed layout (0 = not packed)
 
 
+# ------【核心逻辑/显存 profiling】KVCacheGroupSpec：Engine→KV cache manager 的层分组 DTO，同组层共享同一块表 ------
 @dataclass
 class KVCacheGroupSpec:
     """
@@ -1069,24 +1105,31 @@ class KVCacheGroupSpec:
     These layers are regarded as one layer in the KV cache manager.
     """
 
+    # ------【核心逻辑】layer_names：组内层名列表 ------
     # The names of model layers in this group
     layer_names: list[str]
+    # ------【显存 profiling】kv_cache_spec：该组对应的 KV cache spec ------
     # The KV cache spec of this manager layer
     kv_cache_spec: KVCacheSpec
+    # ------【投机解码】is_eagle_group：是否为 EAGLE/MTP 草稿注意力层组 ------
     # Whether this group contains EAGLE/MTP draft attention layers.
     is_eagle_group: bool = False
 
 
+# ------【显存 profiling/核心逻辑】KVCacheConfig：Worker→Engine 的整模型 KV cache 显存规格消息，经 executor 回传后分配张量、建块表 ------
 @dataclass
 class KVCacheConfig:
     """
     The KV cache configuration of a model.
     """
 
+    # ------【显存 profiling】num_blocks：KV cache 块总数（池容量） ------
     num_blocks: int
     """The number of KV cache blocks"""
+    # ------【显存 profiling】kv_cache_tensors：每层 KV cache 张量初始化规格列表 ------
     kv_cache_tensors: list[KVCacheTensor]
     """How should model runner initialize the KV cache tensors for each layer"""
+    # ------【核心逻辑】kv_cache_groups：KV cache 分组列表（同构层合并为一组） ------
     kv_cache_groups: list[KVCacheGroupSpec]
     """
     The kv cache groups of the model.
@@ -1096,10 +1139,12 @@ class KVCacheConfig:
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
 
+    # ------【核心逻辑】has_mamba_layers：是否含 Mamba 层（决定是否走 Mamba 状态初始化/清零逻辑） ------
     @property
     def has_mamba_layers(self) -> bool:
         return any(isinstance(g.kv_cache_spec, MambaSpec) for g in self.kv_cache_groups)
 
+    # ------【显存 profiling/量化】has_mixed_precision_kv_cache：是否存在多精度 KV cache 分组 ------
     @property
     def has_mixed_precision_kv_cache(self) -> bool:
         """Whether attention groups store their KV cache at more than one precision."""
@@ -1118,6 +1163,7 @@ class KVCacheConfig:
             )
         return len(kv_cache_precisions) > 1
 
+    # ------【显存 profiling/核心逻辑】needs_kv_cache_zeroing：新分配块是否须先清零（Mamba 或混合精度缓存） ------
     @property
     def needs_kv_cache_zeroing(self) -> bool:
         """Whether newly allocated KV cache blocks must be zeroed before use.

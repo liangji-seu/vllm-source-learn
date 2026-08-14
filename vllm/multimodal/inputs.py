@@ -96,28 +96,40 @@ these are directly passed to the model without HF processing.
 """
 
 
+# ------【异步 RPC】VisionChunkImage：图像「视觉块」规格消息，处理管线与模型间传输 ------
 class VisionChunkImage(TypedDict):
     """Represents an image wrapped as a vision chunk."""
 
+    # ------【核心逻辑】type：字面量标记该视觉块为 image 类型 ------
     type: Literal["image"]
+    # ------【核心逻辑】image：图像数据（PIL Image 对象） ------
     image: Image
+    # ------【前缀缓存】uuid：图像唯一标识，用于缓存键去重 ------
     uuid: str | None
 
 
+# ------【异步 RPC】VisionChunkVideo：视频块规格消息，含帧图像列表与元数据 ------
 class VisionChunkVideo(TypedDict):
     """Represents a video chunk with metadata."""
 
+    # ------【核心逻辑】type：字面量标记该视觉块为 video_chunk 类型 ------
     type: Literal["video_chunk"]
+    # ------【核心逻辑】video_chunk：该视频块的帧图像列表 ------
     video_chunk: list[Image]
+    # ------【前缀缓存】uuid：视频唯一标识，用于缓存键去重 ------
     uuid: str | None
+    # ------【核心逻辑】prompt：该视频块关联的文本提示词 ------
     prompt: str
+    # ------【核心逻辑】video_idx：视频在请求中的序号 ------
     video_idx: int
 
 
+# ------【异步 RPC】VisionChunk：视觉块联合类型，图像块或视频块二选一 ------
 VisionChunk: TypeAlias = VisionChunkImage | VisionChunkVideo
 """A vision chunk is either an image or a video chunk."""
 
 
+# ------【核心逻辑】PlaceholderRange：占位符位置规格，描述多模态 token 在 prompt 中的位置 ------
 @dataclass(frozen=True)
 class PlaceholderRange:
     """
@@ -135,29 +147,35 @@ class PlaceholderRange:
     ```
     """
 
+    # ------【核心逻辑】offset：占位符在 prompt 中的起始索引 ------
     offset: int
     """The start index of the placeholder in the prompt."""
 
+    # ------【核心逻辑】length：占位符占据的 token 长度 ------
     length: int
     """The length of the placeholder."""
 
+    # ------【核心逻辑】is_embed：布尔掩码，标记哪些位置需分配 embedding ------
     is_embed: "torch.Tensor | None" = None
     """
     A boolean mask of shape `(length,)` indicating which positions
     between `offset` and `offset + length` to assign embeddings to.
     """
 
+    # ------【核心逻辑】embeds_cumsum：缓存 cumsum 并转 Python list，避免 torch C++ 开销 ------
     @cached_property
     def embeds_cumsum(self) -> list[int] | None:
         # python list so python indexing avoids torch C++ overhead/conversions/deallocs
         return None if self.is_embed is None else self.is_embed.cumsum(dim=0).tolist()
 
+    # ------【核心逻辑】get_num_embeds：返回该占位符需分配的 embedding 数量 ------
     def get_num_embeds(self) -> int:
         if self.embeds_cumsum is None:
             return self.length
 
         return self.embeds_cumsum[-1] if self.embeds_cumsum else 0
 
+    # ------【核心逻辑】get_embeds_indices_in_range：求区间内 embedding 的起止索引 ------
     def get_embeds_indices_in_range(
         self, start_idx: int, end_idx: int
     ) -> tuple[int, int]:
@@ -179,6 +197,7 @@ class PlaceholderRange:
 
         return embeds_start_idx, embeds_end_idx
 
+    # ------【核心逻辑】extract_embeds_range：提取 prompt 中被 embedding 区域的起止索引 ------
     def extract_embeds_range(self) -> list[tuple[int, int]]:
         """Extract the start and end indices of the embedded region in prompt.
 
@@ -204,6 +223,7 @@ class PlaceholderRange:
         ranges = torch.stack((starts, ends), dim=1) + self.offset
         return [tuple(x) for x in ranges.tolist()]
 
+    # ------【核心逻辑】__eq__：按 offset/length/is_embed 比较占位符是否相等 ------
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, self.__class__):
             return False
@@ -218,6 +238,7 @@ class PlaceholderRange:
         return nested_tensors_equal(self.is_embed, other.is_embed)
 
 
+# ------【核心逻辑】NestedTensors：嵌套张量结构，各元素维度不一致时用 list 而非 tensor ------
 NestedTensors: TypeAlias = Union[
     list["NestedTensors"],
     list["torch.Tensor"],
@@ -325,6 +346,7 @@ def batched_tensors_equal(a: BatchedTensorInputs, b: BatchedTensorInputs) -> boo
     return all(k in b and nested_tensors_equal(a[k], b[k]) for k in a)
 
 
+# ------【异步 RPC】MultiModalFeatureSpec：单个多模态输入规格消息，跟踪处理数据与缓存元数据 ------
 @dataclass
 class MultiModalFeatureSpec:
     """
@@ -335,6 +357,7 @@ class MultiModalFeatureSpec:
     `MultiModalFeatureSpec` per item.
     """
 
+    # ------【异步 RPC】data：该特征的数据，None 表示已缓存以跳过 API↔EngineCore 的 IPC ------
     data: "MultiModalKwargsItem | None"
     """
     Represents multimodal data for this feature.
@@ -343,21 +366,26 @@ class MultiModalFeatureSpec:
     and engine core processes.
     """
 
+    # ------【核心逻辑】modality：输入模态，如 image/audio/video ------
     modality: str
     """The input modality, e.g., `"image"`, `"audio"`, `"video"`."""
 
+    # ------【前缀缓存】identifier：编码器输出缓存哈希（含 LoRA 前缀） ------
     identifier: str
     """The hash for caching encoder outputs (with LoRA prefix if applicable)."""
 
+    # ------【核心逻辑】mm_position：该模态 token 在 prompt 中的占位符位置 ------
     mm_position: PlaceholderRange
     """
     The location of the `modality` tokens corresponding to this item
     in the prompt, e.g., `PlaceholderRange(offset=2, length=336)`.
     """
 
+    # ------【前缀缓存】mm_hash：处理器输出缓存哈希（不含 LoRA 前缀） ------
     mm_hash: str | None = None
     """The hash for caching processor outputs (without LoRA prefix)."""
 
+    # ------【核心逻辑】gather_kwargs：按 keys 聚合各特征的数据张量，供批处理 ------
     @staticmethod
     def gather_kwargs(features: list["MultiModalFeatureSpec"], keys: set[str]):
         kwargs = defaultdict[str, list[NestedTensors]](list)
@@ -372,6 +400,7 @@ class MultiModalFeatureSpec:
         return dict(kwargs)
 
 
+# ------【核心逻辑】MultiModalFieldElem：处理后的关键字参数封装，包装张量数据与批处理方式 ------
 @dataclass
 class MultiModalFieldElem:
     """
@@ -379,6 +408,7 @@ class MultiModalFieldElem:
     [`MultiModalKwargsItem`][vllm.multimodal.inputs.MultiModalKwargsItem].
     """
 
+    # ------【异步 RPC】data：该字段的张量数据，None 表示已在 EngineCore 缓存 ------
     data: NestedTensors
     """
     The tensor data of this field in
@@ -389,12 +419,14 @@ class MultiModalFieldElem:
     in `EngineCore`.
     """
 
+    # ------【核心逻辑】field：定义该字段与其它字段如何组合以批处理多模态项 ------
     field: "BaseMultiModalField"
     """
     Defines how to combine the tensor data of this field with others
     in order to batch multi-modal items together for model inference.
     """
 
+    # ------【核心逻辑】__eq__：按张量相等与字段类型比较两个 elem ------
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, self.__class__):
             return False
@@ -409,6 +441,7 @@ class MultiModalFieldElem:
         return data_equal and type(self.field) is type(other.field)  # noqa: E721
 
 
+# ------【核心逻辑】BaseMultiModalField：定义字段张量数据如何在批处理时组合/拆分 ------
 @dataclass(frozen=True, kw_only=True)
 class BaseMultiModalField(ABC):
     """
@@ -417,6 +450,7 @@ class BaseMultiModalField(ABC):
     and vice versa.
     """
 
+    # ------【显存 profiling】keep_on_cpu：是否将该字段留在 CPU，避免搬到加速卡以省显存 ------
     keep_on_cpu: bool = False
     """
     If `True`, then this field is excluded from being moved to the accelerator when
@@ -424,6 +458,7 @@ class BaseMultiModalField(ABC):
     is called to batch the data.
     """
 
+    # ------【核心逻辑】_field_factory：返回绑定 self 的工厂函数，供 build_elems 构造 elem ------
     def _field_factory(self):
         f = partial(MultiModalFieldElem, field=self)
 
@@ -433,6 +468,7 @@ class BaseMultiModalField(ABC):
 
         return factory
 
+    # ------【核心逻辑】build_elems：把一份批数据拆成若干 elem，与 reduce_data 互为逆操作 ------
     @abstractmethod
     def build_elems(
         self,
@@ -450,6 +486,7 @@ class BaseMultiModalField(ABC):
         """
         raise NotImplementedError
 
+    # ------【核心逻辑】_reduce_data：把若干字段数据合并成单一批张量（子类实现具体合并方式） ------
     @abstractmethod
     def _reduce_data(
         self,
@@ -459,6 +496,7 @@ class BaseMultiModalField(ABC):
     ) -> NestedTensors:
         raise NotImplementedError
 
+    # ------【核心逻辑】reduce_data：校验字段类型并合并数据，处理 keep_on_cpu 与 H2D 搬运 ------
     def reduce_data(
         self,
         elems: list[MultiModalFieldElem],
@@ -494,6 +532,7 @@ class BaseMultiModalField(ABC):
         return _nested_tensors_h2d(out, device=device)
 
 
+# ------【核心逻辑】MultiModalBatchedField：沿首维索引拆批，每个样本独立一份张量 ------
 @dataclass(frozen=True, kw_only=True)
 class MultiModalBatchedField(BaseMultiModalField):
     """
@@ -501,6 +540,7 @@ class MultiModalBatchedField(BaseMultiModalField):
         [`MultiModalFieldConfig.batched`][vllm.multimodal.inputs.MultiModalFieldConfig.batched]
     """
 
+    # ------【核心逻辑】build_elems：沿首维逐个取出元素，生成与 batch 等长的 elem 序列 ------
     def build_elems(
         self,
         modality: str,
@@ -510,6 +550,7 @@ class MultiModalBatchedField(BaseMultiModalField):
         field_factory = self._field_factory()
         return [field_factory(item) for item in data]
 
+    # ------【核心逻辑】_reduce_data：沿新首维 stack 合并；单张量走 unsqueeze 零拷贝路径 ------
     def _reduce_data(
         self,
         batch: list[NestedTensors],
@@ -542,6 +583,7 @@ class MultiModalBatchedField(BaseMultiModalField):
         return batch
 
 
+# ------【核心逻辑】MultiModalFlatField：按切片切分扁平张量，支持变长项合并 ------
 @dataclass(frozen=True, kw_only=True)
 class MultiModalFlatField(BaseMultiModalField):
     """
@@ -550,9 +592,12 @@ class MultiModalFlatField(BaseMultiModalField):
         [`MultiModalFieldConfig.flat_from_sizes`][vllm.multimodal.inputs.MultiModalFieldConfig.flat_from_sizes]
     """
 
+    # ------【核心逻辑】slices：每个样本对应的切片（dim>0 时为嵌套切片元组） ------
     slices: Sequence[slice] | Sequence[Sequence[slice]]
+    # ------【核心逻辑】dim：切片维度，默认沿第 0 维切分 ------
     dim: int = 0
 
+    # ------【核心逻辑】build_elems：按 slices 逐段切出子张量，生成对应 elem ------
     def build_elems(
         self,
         modality: str,
@@ -566,6 +611,7 @@ class MultiModalFlatField(BaseMultiModalField):
             )
         return [field_factory(data[cast(slice, s)]) for s in self.slices]
 
+    # ------【核心逻辑】_reduce_data：沿 dim 拼接；等形走 concat，变长走 slice-assign 零填充 ------
     def _reduce_data(
         self,
         batch: list[NestedTensors],
@@ -588,6 +634,7 @@ class MultiModalFlatField(BaseMultiModalField):
 
             dim = self.dim + (self.dim < 0) * len(batch[0].shape)
 
+            # ------【核心逻辑】_shape_before_after：返回 dim 前后两段形状，用于判断能否整体拼接 ------
             def _shape_before_after(tensor: torch.Tensor):
                 return tensor.shape[:dim], tensor.shape[dim + 1 :]
 
@@ -649,6 +696,7 @@ class MultiModalFlatField(BaseMultiModalField):
         return [e for elem in batch for e in elem]
 
 
+# ------【核心逻辑】MultiModalSharedField：整份数据被整个 batch 共享，仅存一份减少内存 ------
 @dataclass(frozen=True, kw_only=True)
 class MultiModalSharedField(BaseMultiModalField):
     """
@@ -656,8 +704,10 @@ class MultiModalSharedField(BaseMultiModalField):
         [`MultiModalFieldConfig.shared`][vllm.multimodal.inputs.MultiModalFieldConfig.shared]
     """
 
+    # ------【核心逻辑】batch_size：共享这份数据的多模态项数量 ------
     batch_size: int
 
+    # ------【核心逻辑】build_elems：同一份数据复制出 batch_size 个 elem ------
     def build_elems(
         self,
         modality: str,
@@ -667,6 +717,7 @@ class MultiModalSharedField(BaseMultiModalField):
         field_factory = self._field_factory()
         return [field_factory(data)] * self.batch_size
 
+    # ------【核心逻辑】_reduce_data：共享数据合并时只需取第一个元素 ------
     def _reduce_data(
         self,
         batch: list[NestedTensors],
@@ -676,8 +727,10 @@ class MultiModalSharedField(BaseMultiModalField):
         return batch[0]
 
 
+# ------【核心逻辑】MultiModalFieldConfig：字段配置工厂，指定模态下某关键字参数的批处理方式 ------
 @dataclass(frozen=True)
 class MultiModalFieldConfig:
+    # ------【核心逻辑】batched：构造「按首维索引拆分」的字段配置 ------
     @staticmethod
     def batched(modality: str, *, keep_on_cpu: bool = False):
         """
@@ -708,6 +761,7 @@ class MultiModalFieldConfig:
             modality=modality,
         )
 
+    # ------【核心逻辑】flat：构造「按切片拆分」的字段配置 ------
     @staticmethod
     def flat(
         modality: str,
@@ -770,6 +824,7 @@ class MultiModalFieldConfig:
             modality=modality,
         )
 
+    # ------【核心逻辑】flat_from_sizes：按每个样本长度累加生成切片，再复用 flat ------
     @staticmethod
     def flat_from_sizes(
         modality: str,
@@ -843,6 +898,7 @@ class MultiModalFieldConfig:
             keep_on_cpu=keep_on_cpu,
         )
 
+    # ------【核心逻辑】shared：构造「整份数据被 batch 共享」的字段配置 ------
     @staticmethod
     def shared(
         modality: str,
@@ -886,9 +942,12 @@ class MultiModalFieldConfig:
             modality=modality,
         )
 
+    # ------【核心逻辑】field：决定该字段如何拆/合的批处理策略对象 ------
     field: BaseMultiModalField
+    # ------【核心逻辑】modality：该字段所属模态，如 image/audio/video ------
     modality: str
 
+    # ------【核心逻辑】build_elems：委托 field 把批数据拆成 elem ------
     def build_elems(
         self,
         key: str,
@@ -897,6 +956,7 @@ class MultiModalFieldConfig:
         return self.field.build_elems(self.modality, key, batch)
 
 
+# ------【核心逻辑】MultiModalKwargsItem：单个多模态项的处理后关键字参数 DTO，processor→模型 ------
 class MultiModalKwargsItem(UserDict[str, MultiModalFieldElem]):
     """
     A dictionary of processed keyword arguments to pass to the model,
@@ -904,6 +964,7 @@ class MultiModalKwargsItem(UserDict[str, MultiModalFieldElem]):
     [`MultiModalDataItems`][vllm.multimodal.parse.MultiModalDataItems].
     """
 
+    # ------【核心逻辑】dummy：测试用便捷构造，生成含单个哑元字段的 item ------
     @staticmethod
     def dummy(nbytes: int = 1):
         """Convenience class for testing."""
@@ -913,10 +974,12 @@ class MultiModalKwargsItem(UserDict[str, MultiModalFieldElem]):
         )
         return MultiModalKwargsItem({"dummy": mm_elem})
 
+    # ------【核心逻辑】get_data：取出每个字段的原始张量数据，丢弃 field 元信息 ------
     def get_data(self) -> dict[str, NestedTensors]:
         return {key: elem.data for key, elem in self.items()}
 
 
+# ------【前缀缓存】_I：item 类型参数，允许 None 表示该项已被缓存跳过 ------
 _I = TypeVar(
     "_I",
     MultiModalKwargsItem,
@@ -925,6 +988,7 @@ _I = TypeVar(
 )
 
 
+# ------【核心逻辑】MultiModalKwargsItems：按模态组织的处理后输入字典，跨请求合并以提升吞吐 ------
 class MultiModalKwargsItems(UserDict[str, Sequence[_I]]):
     """
     A dictionary of processed multi-modal inputs by modality.
@@ -961,6 +1025,7 @@ class MultiModalKwargsItems(UserDict[str, Sequence[_I]]):
     for each keyword argument.
     """
 
+    # ------【核心逻辑】from_hf_inputs：把 HF 批处理输出按配置拆成按模态组织的 item 列表 ------
     @staticmethod
     def from_hf_inputs(
         hf_inputs: "BatchFeature",
@@ -997,6 +1062,7 @@ class MultiModalKwargsItems(UserDict[str, Sequence[_I]]):
 
         return MultiModalKwargsItems(items_by_modality)
 
+    # ------【核心逻辑】__getitem__：按模态取 item 序列，缺失时给出可用模态报错 ------
     def __getitem__(self, modality: str) -> Sequence[_I]:
         if modality not in self:
             raise KeyError(
@@ -1006,6 +1072,7 @@ class MultiModalKwargsItems(UserDict[str, Sequence[_I]]):
 
         return super().__getitem__(modality)  # type: ignore[return-value]
 
+    # ------【核心逻辑】require_data：校验没有 None item，返回非空版本供后续批处理 ------
     def require_data(self) -> "MultiModalKwargsItems[MultiModalKwargsItem]":
         for modality, items in self.items():
             for i, item in enumerate(items):
@@ -1014,6 +1081,7 @@ class MultiModalKwargsItems(UserDict[str, Sequence[_I]]):
 
         return self  # type: ignore[return-value]
 
+    # ------【核心逻辑】get_data：按 field 策略合并各模态数据为单个批字典，供模型前向 ------
     def get_data(
         self,
         *,
@@ -1055,6 +1123,7 @@ class MultiModalKwargsItems(UserDict[str, Sequence[_I]]):
         return out_data
 
 
+# ------【前缀缓存】MultiModalKwargsOptionalItems：允许 item 为 None 的别名（缓存命中时） ------
 MultiModalKwargsOptionalItems: TypeAlias = (
     MultiModalKwargsItems[MultiModalKwargsItem]
     | MultiModalKwargsItems[MultiModalKwargsItem | None]

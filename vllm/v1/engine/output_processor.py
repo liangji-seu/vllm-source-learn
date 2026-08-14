@@ -42,6 +42,7 @@ from vllm.v1.metrics.stats import (
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
 
 
+# ------【异步 RPC】RequestOutputCollector：请求输出收集器，EngineCore 生产者→asyncio generate 消费任务的非阻塞交接缓冲 ------
 class RequestOutputCollector:
     """
     Collects streamed RequestOutputs per individual request,
@@ -52,13 +53,19 @@ class RequestOutputCollector:
     """
 
     def __init__(self, output_kind: RequestOutputKind, request_id: str):
+        # ------【核心逻辑】aggregate：是否为 DELTA 增量模式，决定多次输出是否合并 ------
         self.aggregate = output_kind == RequestOutputKind.DELTA
+        # ------【核心逻辑】request_id：内部请求 ID，标识该收集器所属请求 ------
         self.request_id = request_id
+        # ------【异步 RPC】output：当前暂存输出，put/get 单缓冲交接 ------
         self.output: RequestOutput | PoolingRequestOutput | Exception | None = None
+        # ------【异步 RPC】ready：asyncio 事件，get() 阻塞等待 put 到来 ------
         self.ready = asyncio.Event()
 
+        # ------【异步 RPC】_input_stream_task：后台输入流任务句柄，close 时取消 ------
         self._input_stream_task: asyncio.Task | None = None
 
+    # ------【异步 RPC】put：非阻塞写入输出；生产者领先时合并 DELTA 输出，异常直接覆盖 ------
     def put(self, output: RequestOutput | PoolingRequestOutput | Exception) -> None:
         """Non-blocking put operation."""
         if self.output is None or isinstance(output, Exception):
@@ -75,6 +82,7 @@ class RequestOutputCollector:
         ):
             self.output = output
 
+    # ------【异步 RPC】get：阻塞等待直到有输出；异常输出在此抛出 ------
     async def get(self) -> RequestOutput | PoolingRequestOutput:
         """Get operation blocks on put event."""
         while (output := self.output) is None:
@@ -85,6 +93,7 @@ class RequestOutputCollector:
             raise output
         return output
 
+    # ------【异步 RPC】get_nowait：非阻塞取走输出，无则返回 None ------
     def get_nowait(self) -> RequestOutput | PoolingRequestOutput | None:
         """Non-blocking get operation."""
         output = self.output
@@ -95,23 +104,29 @@ class RequestOutputCollector:
             raise output
         return output
 
+    # ------【异步 RPC】close：取消后台输入流任务，释放句柄 ------
     def close(self):
         if self._input_stream_task is not None:
             self._input_stream_task.cancel()
         self._input_stream_task = None
 
+    # ------【异步 RPC】__del__：析构时线程安全地取消未完成的后台任务 ------
     def __del__(self):
         if (task := self._input_stream_task) is not None:
             task.get_loop().call_soon_threadsafe(task.cancel)
             self._input_stream_task = None
 
 
+# ------【核心逻辑】OutputProcessorOutput：OutputProcessor 处理结果容器，EngineCore 输出→前端的批量打包 DTO ------
 @dataclass
 class OutputProcessorOutput:
+    # ------【核心逻辑】request_outputs：本轮要返回前端的请求输出列表(无队列 LLMEngine 时) ------
     request_outputs: list[RequestOutput | PoolingRequestOutput]
+    # ------【核心逻辑】reqs_to_abort：detokenizer 检出 stop 串但 EngineCore 未结束时需中止的请求 ID ------
     reqs_to_abort: list[str]
 
 
+# ------【异步 RPC】StreamingUpdate：流式输入增量 DTO，承载子请求完成时追加到 RequestState 的新 prompt 片段 ------
 @dataclass
 class StreamingUpdate:
     """Streaming input update data for output processor.
@@ -120,12 +135,17 @@ class StreamingUpdate:
     when the current sub-request completes.
     """
 
+    # ------【核心逻辑】prompt：本轮新增的 prompt 文本片段(可能为 None) ------
     prompt: str | None
+    # ------【核心逻辑】prompt_token_ids：本轮新增的 prompt token id 片段 ------
     prompt_token_ids: list[int] | None
+    # ------【核心逻辑】arrival_time：增量片段到达时间戳，用于更新请求统计 ------
     arrival_time: float
+    # ------【核心逻辑】final：是否流式输入最终片段，置位后停止继续等待 ------
     final: bool = False
 
 
+# ------【核心逻辑】RequestState：单请求在 OutputProcessor 侧的状态快照，聚合 detokenize/logprobs/LoRA/统计，输出到前端 ------
 class RequestState:
     def __init__(
         self,
@@ -150,45 +170,73 @@ class RequestState:
         temperature: float | None = None,
         stream_input: bool = False,
     ):
+        # ------【核心逻辑】request_id：内部随机生成的请求 ID，作为 request_states 字典键 ------
         self.request_id = request_id
+        # ------【核心逻辑】external_req_id：用户侧/API 传入的外部请求 ID，用于对外输出 ------
         self.external_req_id = external_req_id
+        # ------【投机解码】parent_req：并行采样(n>1)的父请求对象，聚合多个子请求输出 ------
         self.parent_req = parent_req
+        # ------【核心逻辑】request_index：本请求在父请求 n 个采样中的索引(0..n-1) ------
         self.request_index = request_index
+        # ------【LoRA】lora_request：本请求绑定的 LoRA 适配器请求对象 ------
         self.lora_request = lora_request
+        # ------【LoRA】lora_name：LoRA 适配器名称，用于统计与完成后释放引用 ------
         self.lora_name = lora_request.lora_name if lora_request is not None else None
+        # ------【核心逻辑】output_kind：输出模式(DELTA/FINAL_ONLY/累积)，决定增量还是全量返回 ------
         self.output_kind = output_kind
+        # ------【核心逻辑】prompt：解码后的 prompt 文本，流式输入时逐段拼接 ------
         self.prompt = prompt
+        # ------【核心逻辑】prompt_token_ids：prompt 的 token id 序列 ------
         self.prompt_token_ids = prompt_token_ids
+        # ------【核心逻辑】prompt_embeds：多模态等场景直接提供的 prompt embedding ------
         self.prompt_embeds = prompt_embeds
+        # ------【核心逻辑】prompt_len：prompt 有效长度(token 数或 embed 数)，用于统计 ------
         self.prompt_len = length_from_prompt_token_ids_or_embeds(
             self.prompt_token_ids, self.prompt_embeds
         )
+        # ------【核心逻辑】logprobs_processor：对数概率处理，按需计算 sample/prompt logprobs ------
         self.logprobs_processor = logprobs_processor
+        # ------【核心逻辑】detokenizer：增量解码器，把 token id 流转文本并做停止词检测 ------
         self.detokenizer = detokenizer
+        # ------【核心逻辑】max_tokens_param：用户指定的最大生成 token 数上限 ------
         self.max_tokens_param = max_tokens_param
+        # ------【核心逻辑】top_p：核采样参数，仅用于 tracing 上报 ------
         self.top_p = top_p
+        # ------【投机解码】n：并行采样数量，>1 表示存在多个子请求 ------
         self.n = n
+        # ------【核心逻辑】temperature：采样温度参数，仅用于 tracing 上报 ------
         self.temperature = temperature
+        # ------【chunked prefill】is_prefilling：是否处于 prefill 阶段，用于统计 cached token ------
         self.is_prefilling = True
+        # ------【异步 RPC】queue：AsyncLLM 模式下挂接的收集器，把输出投递到 generate() 任务 ------
         self.queue = queue
+        # ------【前缀缓存】num_cached_tokens：命中前缀缓存的 token 数，对外报告 ------
         self.num_cached_tokens = 0
+        # ------【前缀缓存】num_cache_creation_tokens：本次写入前缀缓存的 token 数 ------
         self.num_cache_creation_tokens = 0
 
+        # ------【核心逻辑】stats：请求级统计快照(延迟/吞吐)，log_stats 关闭时为 None ------
         self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
 
         # Routed experts accumulation (prompt + sample chunks)
+        # ------【EP/EPLB】routed_experts_chunks：各 chunk 命中的路由专家 id，结束时拼接上报 ------
         self.routed_experts_chunks: list[np.ndarray] = []
 
         # Stream Interval
+        # ------【核心逻辑】stream_interval：流式输出间隔，每 N 个 token 返回一次 ------
         self.stream_interval = stream_interval
+        # ------【核心逻辑】sent_tokens_offset：DELTA 模式下已发送 token 的偏移量 ------
         self.sent_tokens_offset = 0  # Offset of sent tokens
 
         # Streaming input queue
+        # ------【异步 RPC】streaming_input：是否启用流式输入(resumable) ------
         self.streaming_input = stream_input
+        # ------【异步 RPC】input_chunk_queue：待应用的流式输入增量队列，子请求完成时逐个出队 ------
         self.input_chunk_queue: deque[StreamingUpdate] | None = (
             deque() if stream_input else None
         )
 
+    # ------【异步 RPC】apply_streaming_update：把流式输入增量应用到状态(拼接 prompt、更新长度与到达时间) ------
     def apply_streaming_update(self, update: StreamingUpdate) -> None:
         # Apply the update to the request state.
         self.streaming_input = not update.final
@@ -208,6 +256,7 @@ class RequestState:
             self.stats.arrival_time = update.arrival_time
         self.is_prefilling = True
 
+    # ------【核心逻辑】from_new_request：由 EngineCoreRequest 构造 RequestState(解析采样参数、建 detokenizer/logprobs) ------
     @classmethod
     def from_new_request(
         cls,
@@ -273,6 +322,7 @@ class RequestState:
             stream_input=request.resumable,
         )
 
+    # ------【核心逻辑】make_request_output：组装 RequestOutput，含 stream_interval 节流与父请求聚合 ------
     def make_request_output(
         self,
         new_token_ids: list[int],
@@ -339,6 +389,7 @@ class RequestState:
             ec_transfer_params,
         )
 
+    # ------【核心逻辑】_new_request_output：构造最终 RequestOutput/PoolingRequestOutput，填入缓存统计与 metrics ------
     def _new_request_output(
         self,
         external_req_id: str,
@@ -385,6 +436,7 @@ class RequestState:
             metrics=self.stats,
         )
 
+    # ------【核心逻辑】_new_completion_output：构造 CompletionOutput，按 delta 模式裁剪文本/logprobs，结束时拼接路由专家 ------
     def _new_completion_output(
         self,
         token_ids: list[int],
@@ -422,10 +474,12 @@ class RequestState:
             stop_reason=stop_reason if finished else None,
         )
 
+    # ------【核心逻辑】_new_pooling_output：把 pooling 张量包装成 PoolingOutput ------
     def _new_pooling_output(self, pooling_output: torch.Tensor) -> PoolingOutput:
         return PoolingOutput(data=pooling_output)
 
 
+# ------【核心逻辑】OutputProcessor：输出编排器，把 EngineCoreOutputs 加工成 RequestOutputs 并分发/上报 ------
 class OutputProcessor:
     """Process EngineCoreOutputs into RequestOutputs."""
 
@@ -437,21 +491,32 @@ class OutputProcessor:
         stream_interval: int = 1,
         tracing_enabled: bool = False,
     ):
+        # ------【核心逻辑】log_stats：是否记录请求级统计，关闭则 stats 为 None ------
         self.log_stats = log_stats
+        # ------【核心逻辑】tokenizer：分词器，用于 detokenize/logprobs(可能为 None) ------
         self.tokenizer = tokenizer
+        # ------【核心逻辑】stream_interval：引擎级流式输出间隔，请求级可再放大 ------
         self.stream_interval = stream_interval
+        # ------【核心逻辑】request_states：内部请求 ID → 请求状态快照 的映射 ------
         self.request_states: dict[str, RequestState] = {}
+        # ------【投机解码】parent_requests：父请求 ID → 父请求对象，聚合并行采样输出 ------
         self.parent_requests: dict[str, ParentRequest] = {}
+        # ------【核心逻辑】external_req_ids：外部请求 ID → 内部请求 ID 列表，支持一对多(n>1)映射 ------
         self.external_req_ids: defaultdict[str, list[str]] = defaultdict(list)
+        # ------【LoRA】lora_states：LoRA 活跃/峰值统计状态 ------
         self.lora_states = LoRARequestStates(log_stats)
+        # ------【核心逻辑】tracing_enabled：是否开启 OpenTelemetry 追踪上报 ------
         self.tracing_enabled = tracing_enabled
 
+    # ------【核心逻辑】get_num_unfinished_requests：返回未完成请求数(等于 request_states 长度) ------
     def get_num_unfinished_requests(self):
         return len(self.request_states)
 
+    # ------【核心逻辑】has_unfinished_requests：是否还有未完成请求 ------
     def has_unfinished_requests(self) -> bool:
         return len(self.request_states) > 0
 
+    # ------【异步 RPC】propagate_error：把异常投递到所有请求的 queue，唤醒阻塞中的 generate() 任务 ------
     def propagate_error(self, e: Exception):
         """Propagate error to all generate() tasks."""
 
@@ -459,6 +524,7 @@ class OutputProcessor:
             assert state.queue is not None
             state.queue.put(e)
 
+    # ------【核心逻辑】abort_requests：中止一批请求(支持外部/内部 ID、父子采样级联)，返回需 EngineCore 中止的内部 ID ------
     def abort_requests(self, request_ids: Iterable[str], internal: bool) -> list[str]:
         """Abort a list of requests.
 
@@ -522,6 +588,7 @@ class OutputProcessor:
                 self.parent_requests.pop(request_id, None)
         return request_ids_to_abort
 
+    # ------【核心逻辑】add_request：注册新请求状态，重复 ID 走流式输入更新路径，维护外部→内部 ID 映射 ------
     def add_request(
         self,
         request: EngineCoreRequest,
@@ -553,6 +620,7 @@ class OutputProcessor:
         # Track the external_req_id -> [internal_req_id, ...] mapping
         self.external_req_ids[req_state.external_req_id].append(request_id)
 
+    # ------【异步 RPC】_update_streaming_request_state：队列化流式输入增量，最终片段标记 final 并清理 ------
     def _update_streaming_request_state(
         self, req_state: RequestState, request: EngineCoreRequest, prompt: str | None
     ) -> None:
@@ -586,6 +654,7 @@ class OutputProcessor:
             # Queue the streaming update otherwise.
             req_state.input_chunk_queue.append(update)
 
+    # ------【核心逻辑】process_outputs：唯一遍历 EngineCoreOutputs 的入口，统计→detokenize→组包→入队/返回 ------
     def process_outputs(
         self,
         engine_core_outputs: list[EngineCoreOutput],
@@ -710,6 +779,7 @@ class OutputProcessor:
             reqs_to_abort=reqs_to_abort,
         )
 
+    # ------【核心逻辑】_finish_request：从状态表移除完成请求，清理外部 ID 映射与父请求 ------
     def _finish_request(self, req_state: RequestState) -> None:
         req_id = req_state.request_id
         self.request_states.pop(req_id)
@@ -724,9 +794,11 @@ class OutputProcessor:
         if parent_req and not parent_req.child_requests:
             self.parent_requests.pop(parent_req.request_id, None)
 
+    # ------【LoRA】update_scheduler_stats：把调度器统计喂给 LoRA 状态，更新活跃/峰值计数 ------
     def update_scheduler_stats(self, scheduler_stats: SchedulerStats | None):
         self.lora_states.update_scheduler_stats(scheduler_stats)
 
+    # ------【核心逻辑】do_tracing：构造延迟/用量属性，上报单请求 OpenTelemetry span ------
     def do_tracing(
         self,
         engine_core_output: EngineCoreOutput,
@@ -789,6 +861,7 @@ class OutputProcessor:
             kind=SpanKind.SERVER,
         )
 
+    # ------【核心逻辑】_update_stats_from_output：把 EngineCore 输出喂给迭代统计(含 LoRA 状态) ------
     def _update_stats_from_output(
         self,
         req_state: RequestState,
@@ -810,6 +883,7 @@ class OutputProcessor:
             req_state.lora_name,
         )
 
+    # ------【核心逻辑】_update_stats_from_finished：请求结束时汇总最终统计并释放 LoRA 引用 ------
     def _update_stats_from_finished(
         self,
         req_state: RequestState,
