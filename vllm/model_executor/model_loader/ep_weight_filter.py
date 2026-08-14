@@ -24,6 +24,7 @@ def parse_expert_id(weight_name: str) -> int | None:
     Returns ``None`` for dense weights (attention, layernorm, embedding),
     shared experts, and 3D fused-expert tensors where all experts are stored
     in a single tensor without a numeric expert id in the name."""
+    # ------【EP 权重切分】正则提取专家 id，未命中返回 None 表示非专家权重 ------
     m = _EXPERT_ID_RE.search(weight_name)
     return int(m.group(1)) if m else None
 
@@ -46,18 +47,22 @@ def compute_local_expert_ids(
         placement: ``"linear"`` for contiguous assignment,
             ``"round_robin"`` for interleaved assignment.
     """
+    # ------【EP 权重切分】无 EP（ep_size<=1）时返回 None，走全量加载路径 ------
     if ep_size <= 1:
         return None
 
+    # ------【EPLB】linear 放置：连续切分，余数专家摊给前几个 rank ------
     if placement == "linear":
         base = num_experts // ep_size
         remainder = num_experts % ep_size
         start = ep_rank * base + min(ep_rank, remainder)
         local_count = base + (1 if ep_rank < remainder else 0)
         return set(range(start, start + local_count))
+    # ------【EPLB】round_robin 放置：按 rank 步长交错分配专家 ------
     elif placement == "round_robin":
         return set(range(ep_rank, num_experts, ep_size))
     else:
+        # ------【EPLB】非法放置策略直接报错，防止静默错配专家 ------
         raise ValueError(f"Unknown expert placement strategy: {placement}")
 
 
@@ -67,8 +72,10 @@ def should_skip_weight(
 ) -> bool:
     """Return ``True`` if *weight_name* is an expert weight that does not
     belong to the local rank and should be skipped during loading."""
+    # ------【EP 权重切分】无本地专家集合（未开 EP）则不过滤任何权重 ------
     if local_expert_ids is None:
         return False
+    # ------【EP 权重切分】提取专家 id，dense/共享专家权重保留不过滤 ------
     eid = parse_expert_id(weight_name)
     if eid is None:
         # Not an expert weight (dense / shared-expert / embedding) → keep.
@@ -76,6 +83,8 @@ def should_skip_weight(
     # Only skip heavy weight tensors, never scale/metadata tensors.
     # Scale tensors are tiny and some backends need them from ALL experts
     # (e.g. FlashInfer NVFP4 computes a global max of activation scales).
+    # ------【EP 权重切分】只过滤大权重张量，scale/metadata 小张量需所有专家加载 ------
     if not weight_name.endswith((".weight", ".weight_packed")):
         return False
+    # ------【EP 权重切分】非本地专家权重跳过加载，消除冗余存储 I/O ------
     return eid not in local_expert_ids

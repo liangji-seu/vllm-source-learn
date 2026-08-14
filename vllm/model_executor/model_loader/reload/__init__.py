@@ -17,6 +17,7 @@ Limitations:
    reloading to fail
 """
 
+# ------【核心逻辑】汇总对外暴露的层式重载 API，供上层模块统一导入 ------
 __all__ = [
     "record_metadata_for_reloading",
     "initialize_layerwise_reload",

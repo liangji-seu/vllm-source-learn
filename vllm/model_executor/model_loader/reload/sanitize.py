@@ -27,6 +27,7 @@ def sanitize_layer_refs(tensor: torch.Tensor, layer: torch.nn.Module) -> torch.T
     Returns:
         sanitized tensor
     """
+    # ------【核心逻辑】把绑定到 layer 的方法替换为哨兵绑定，切断张量到层的循环引用 ------
     for key, value in tensor.__dict__.items():
         if isinstance(value, MethodType) and value.__self__ is layer:
             tensor.__dict__[key] = value.__func__.__get__(layer_ref_sentinel)
@@ -48,6 +49,7 @@ def restore_layer_refs(tensor: torch.Tensor, layer: torch.nn.Module) -> torch.Te
     Returns:
         sanitized tensor
     """
+    # ------【核心逻辑】把哨兵绑定还原为真实 layer 绑定，恢复 weight_loader 可用性 ------
     for key, value in tensor.__dict__.items():
         if isinstance(value, MethodType) and value.__self__ is layer_ref_sentinel:
             tensor.__dict__[key] = value.__func__.__get__(layer)

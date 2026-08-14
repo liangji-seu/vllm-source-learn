@@ -22,6 +22,7 @@ __all__ = ["set_torchao_reload_attrs", "support_quantized_model_reload_from_hp_w
 
 
 def set_torchao_reload_attrs(model: torch.nn.Module, model_config: ModelConfig):
+    # ------【量化】在模型上标记启用 torchao 重载并保存配置，供装饰器后续读取 ------
     model._do_torchao_reload = True
     model._model_config = model_config
 
@@ -44,13 +45,18 @@ def support_quantized_model_reload_from_hp_weights(original_load_weights: Functi
         *args,
         **kwargs,
     ):
+        # ------【核心逻辑】从 loader 取出被加载的模型 ------
         model = self.module
 
+        # ------【量化】未启用 torchao 重载时走原逻辑，保持普通加载路径不变 ------
         if not getattr(model, "_do_torchao_reload", False):
             return original_load_weights(self, weights, *args, **kwargs)
 
+        # ------【量化】进入层式加载：把模型恢复到 meta 并包装 loader 为在线量化 ------
         initialize_layerwise_reload(model)
+        # ------【权重加载】执行原始高精度权重加载，权重被缓存而非直接写盘 ------
         loaded_weights = original_load_weights(self, weights, *args, **kwargs)
+        # ------【量化】整批加载完后统一物化、在线量化并拷回 kernel 张量 ------
         finalize_layerwise_reload(model, model._model_config)
 
         return loaded_weights

@@ -27,10 +27,12 @@ class RunaiModelStreamerLoader(BaseModelLoader):
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
 
+        # ------【权重传输】默认单进程流式加载，distributed 开启后走多 worker 分片传输 ------
         self._is_distributed: bool = False
         if load_config.model_loader_extra_config:
             extra_config = load_config.model_loader_extra_config
 
+            # ------【核心逻辑】校验 extra_config 只包含 runai_streamer 允许的键 ------
             allowed_keys = {"distributed", "concurrency", "memory_limit"}
             if unexpected_keys := set(extra_config) - allowed_keys:
                 raise ValueError(
@@ -38,6 +40,7 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                     f"{unexpected_keys}"
                 )
 
+            # ------【权重传输】解析 distributed 开关，必须是 bool 类型 ------
             if "distributed" in extra_config:
                 distributed = extra_config["distributed"]
                 if not isinstance(distributed, bool):
@@ -47,6 +50,7 @@ class RunaiModelStreamerLoader(BaseModelLoader):
             # Validate every value before mutating os.environ, so a later
             # invalid key cannot leave an earlier one partially applied.
             env_updates: dict[str, str] = {}
+            # ------【并行加载】校验 concurrency 为正整数，转成环境变量传给底层 streamer ------
             if "concurrency" in extra_config:
                 concurrency = extra_config["concurrency"]
                 if (
@@ -59,6 +63,7 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                     )
                 env_updates["RUNAI_STREAMER_CONCURRENCY"] = str(concurrency)
 
+            # ------【显存 profiling】校验 memory_limit 为 >= -1 整数，限制流式缓冲占用 ------
             if "memory_limit" in extra_config:
                 memory_limit = extra_config["memory_limit"]
                 if (
@@ -70,8 +75,10 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                         f"memory_limit must be an integer >= -1, got {memory_limit!r}"
                     )
                 env_updates["RUNAI_STREAMER_MEMORY_LIMIT"] = str(memory_limit)
+            # ------【核心逻辑】所有值校验通过后一次性写入环境变量，避免半应用状态 ------
             os.environ.update(env_updates)
 
+            # ------【下载缓存】S3 endpoint 缺省时回退复用 AWS_ENDPOINT_URL ------
             runai_streamer_s3_endpoint = os.getenv("RUNAI_STREAMER_S3_ENDPOINT")
             aws_endpoint_url = os.getenv("AWS_ENDPOINT_URL")
             if runai_streamer_s3_endpoint is None and aws_endpoint_url is not None:
@@ -89,6 +96,7 @@ class RunaiModelStreamerLoader(BaseModelLoader):
         safetensors_pattern = "*.safetensors"
         index_file = SAFE_WEIGHTS_INDEX_NAME
 
+        # ------【下载缓存】本地或对象存储直接复用路径，否则从 HF 预取 safetensors ------
         hf_folder = (
             model_name_or_path
             if (is_local or is_object_storage_path)
@@ -100,8 +108,10 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                 ignore_patterns=self.load_config.ignore_patterns,
             )
         )
+        # ------【权重加载】枚举目录下所有 safetensors 文件路径 ------
         hf_weights_files = list_safetensors(path=hf_folder)
 
+        # ------【下载缓存】非本地 HF 模型额外下载权重索引文件，用于定位分片 ------
         if not is_local and not is_object_storage_path:
             download_safetensors_index_file_from_hf(
                 model_name_or_path,
@@ -110,6 +120,7 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                 revision=revision,
             )
 
+        # ------【权重加载】未找到任何权重文件时直接报错 ------
         if not hf_weights_files:
             raise RuntimeError(
                 f"Cannot find any safetensors model weights with `{model_name_or_path}`"
@@ -121,6 +132,7 @@ class RunaiModelStreamerLoader(BaseModelLoader):
         self, model_or_path: str, revision: str | None
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
+        # ------【权重加载】先定位权重文件，再交给 runai 流式迭代器逐张量产出 ------
         hf_weights_files = self._prepare_weights(model_or_path, revision)
         return runai_safetensors_weights_iterator(
             hf_weights_files, self.load_config.use_tqdm_on_load, self._is_distributed
@@ -128,13 +140,16 @@ class RunaiModelStreamerLoader(BaseModelLoader):
 
     def download_model(self, model_config: ModelConfig) -> None:
         """Download model if necessary"""
+        # ------【下载缓存】download 阶段只需确保权重文件已就位 ------
         self._prepare_weights(model_config.model, model_config.revision)
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         """Load weights into a model."""
         model_weights = model_config.model
+        # ------【核心逻辑】允许用 model_weights 覆盖默认模型路径 ------
         if model_weights_override := model_config.model_weights:
             model_weights = model_weights_override
+        # ------【权重传输】把流式权重迭代器交给模型的 load_weights 完成拷贝 ------
         model.load_weights(
             self._get_weights_iterator(model_weights, model_config.revision)
         )

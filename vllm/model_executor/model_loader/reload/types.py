@@ -34,9 +34,11 @@ class LayerReloadingInfo:
     kernel_non_persistent_buffers: set[str] = field(default_factory=set)
 
     def reset(self):
+        # ------【层式加载】复位加载进度/缓存等状态，仅保留 meta 快照与目标设备 ------
         self.__init__(  # type: ignore[misc]
             restore_metadata=self.restore_metadata, restore_device=self.restore_device
         )
 
     def can_load(self) -> bool:
+        # ------【层式加载】load_numel_total 非空表示已初始化，可参与层式加载 ------
         return self.load_numel_total is not None

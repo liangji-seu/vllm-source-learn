@@ -97,6 +97,7 @@ def register_model_loader(load_format: str):
     """  # noqa: E501
 
     def _wrapper(model_loader_cls):
+        # ------【核心逻辑】检查该 load_format 是否已被注册，避免静默覆盖旧 loader ------
         if load_format in _LOAD_FORMAT_TO_MODEL_LOADER:
             logger.warning(
                 "Load format `%s` is already registered, and will be "
@@ -104,10 +105,12 @@ def register_model_loader(load_format: str):
                 load_format,
                 model_loader_cls,
             )
+        # ------【核心逻辑】校验传入类确实是 BaseModelLoader 子类，防止注册非法 loader ------
         if not issubclass(model_loader_cls, BaseModelLoader):
             raise ValueError(
                 "The model loader must be a subclass of `BaseModelLoader`."
             )
+        # ------【核心逻辑】把自定义 loader 写入工厂注册表并记录注册日志 ------
         _LOAD_FORMAT_TO_MODEL_LOADER[load_format] = model_loader_cls
         logger.info(
             "Registered model loader `%s` with load format `%s`",
@@ -122,8 +125,10 @@ def register_model_loader(load_format: str):
 def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
     """Get a model loader based on the load format."""
     load_format = load_config.load_format
+    # ------【核心逻辑】查表前先校验格式是否受支持，给用户明确报错 ------
     if load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
         raise ValueError(f"Load format `{load_format}` is not supported")
+    # ------【核心逻辑】按 load_format 查工厂表并实例化对应 loader ------
     return _LOAD_FORMAT_TO_MODEL_LOADER[load_format](load_config)
 
 
@@ -134,9 +139,12 @@ def get_model(
     prefix: str = "",
     load_config: LoadConfig | None = None,
 ) -> nn.Module:
+    # ------【核心逻辑】解析 load_config 并取得对应的模型加载器 ------
     loader = get_model_loader(load_config or vllm_config.load_config)
+    # ------【核心逻辑】未显式传 model_config 时回退到 vllm_config 里的配置 ------
     if model_config is None:
         model_config = vllm_config.model_config
+    # ------【核心逻辑】委托 loader 完成模型构建与权重加载并返回模型 ------
     return loader.load_model(
         vllm_config=vllm_config, model_config=model_config, prefix=prefix
     )

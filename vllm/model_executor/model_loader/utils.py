@@ -46,16 +46,21 @@ def initialize_model(
     model_config: ModelConfig | None = None,
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
+    # ------【核心逻辑】未显式传入时回退到 vllm_config，统一模型配置来源 ------
     if model_config is None:
         model_config = vllm_config.model_config
+    # ------【核心逻辑】未指定模型类时按架构名解析出 model_class ------
     if model_class is None:
         model_class, _ = get_model_architecture(model_config)
 
+    # ------【量化】先把融合模块映射注入量化配置，供加载时匹配 packed 权重 ------
     if vllm_config.quant_config is not None:
         configure_quant_config(vllm_config.quant_config, model_class)
 
+    # ------【核心逻辑】反射读取 __init__ 参数名，区分 new-style 与 old-style 模型类 ------
     signatures = inspect.signature(model_class.__init__)
     all_params = [param.name for param in signatures.parameters.values()]
+    # ------【核心逻辑】new-style：按 vllm_config+prefix 构造并记录 reload 元数据 ------
     if "vllm_config" in all_params and "prefix" in all_params:
         # new-style model class
         with set_current_vllm_config(vllm_config, check_compile=True, prefix=prefix):
@@ -63,6 +68,7 @@ def initialize_model(
             record_metadata_for_reloading(model)
             return model
 
+    # ------【核心逻辑】缺少新式参数时告警，进入旧式模型兼容路径 ------
     msg = (
         "vLLM model class should accept `vllm_config` and `prefix` as "
         "input arguments. Possibly you have an old-style model class"
@@ -77,6 +83,7 @@ def initialize_model(
         model_class,
     )
     # try to be compatible with old-style model class
+    # ------【核心逻辑】按参数名逐项填 kwargs，兼容旧式模型的多种构造签名 ------
     kwargs: dict[str, Any] = {}
     if "prefix" in all_params:
         kwargs["prefix"] = prefix
@@ -90,6 +97,7 @@ def initialize_model(
         kwargs["lora_config"] = vllm_config.lora_config
     if "scheduler_config" in all_params:
         kwargs["scheduler_config"] = vllm_config.scheduler_config
+    # ------【核心逻辑】old-style：用猜测的 kwargs 构造模型并记录 reload 元数据 ------
     with set_current_vllm_config(vllm_config, check_compile=True, prefix=prefix):
         model = model_class(**kwargs)
         record_metadata_for_reloading(model)
@@ -100,6 +108,7 @@ def initialize_model(
 def process_weights_after_loading(
     model: nn.Module, model_config: ModelConfig, target_device: torch.device
 ) -> None:
+    # ------【量化】遍历所有子模块，找出带 quant_method 的量化层做加载后处理 ------
     for _, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
@@ -108,6 +117,7 @@ def process_weights_after_loading(
             # to be on the global target device. This scope is for the
             # case where cpu offloading is used, where we will move the
             # parameters onto device for processing and back off after.
+            # ------【权重加载】临时把 CPU offload 参数搬到目标设备，再执行量化后处理 ------
             with device_loading_context(module, target_device):
                 quant_method.process_weights_after_loading(module)
             # process_weights_after_loading may swap in freshly-created
@@ -115,15 +125,18 @@ def process_weights_after_loading(
             # global rank in BasevLLMParameter.__init__. Re-reconcile their TP
             # state to the layer so a later weight reload / RL weight-refit
             # narrows replicated (disable_tp) weights at the correct offset.
+            # ------【TP 权重切分】重打包可能换新参数，重对齐 TP 状态避免 offset 错位 ------
             if hasattr(module, "update_param_tp_status"):
                 module.update_param_tp_status()
             # Repacking transients above can leave large amounts of memory in
             # the caching allocator, which starves the OS on UMA devices.
+            # ------【显存 profiling】释放重打包产生的临时显存，防止 UMA 设备内存饥饿 ------
             release_device_memory_under_pressure(target_device)
 
     # Initialize post-load attention weights for any attention layer and MM
     # encoder. NOTE: Happens after other modules so we can easily decompress
     # weights.
+    # ------【核心逻辑】第二轮遍历 attention/MMEncoder 层做加载后权重初始化 ------
     for _, module in model.named_modules():
         if isinstance(module, (AttentionLayerBase, MMEncoderAttention)) and hasattr(
             module, "process_weights_after_loading"
@@ -138,30 +151,36 @@ def process_weights_after_loading(
     # load_weights(). When using DummyModelLoader (e.g. profiling or
     # sleep/wake_up reload), the model's load_weights() is not called, so we
     # must handle HPC modules here generically.
+    # ------【显存 profiling】处理 HPC 模块，兼容 DummyModelLoader 不调用 load_weights 的场景 ------
     for _, module in model.named_modules():
         if isinstance(module, HpcModule):
             module.process_weights_after_loading(model)
 
     # Model-level post-load hook, after the per-layer quant finalize.
+    # ------【核心逻辑】模型级 post-load 钩子，在逐层量化收尾后统一调用 ------
     if hasattr(model, "process_weights_after_loading"):
         model.process_weights_after_loading()
 
     # Needed for torchao model reloading via model.reload_weights
     # @kylesayrs @jerryzh168 this can be removed if callers move to `reload_weights`
+    # ------【量化】torchao 记录 reload 属性，供 reload_weights 恢复量化状态 ------
     if model_config.quantization == "torchao":
         set_torchao_reload_attrs(model, model_config)
 
 
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
+    # ------【权重加载】目标设备是 CPU 则无需搬运，直接让出模块 ------
     if target_device.type == "cpu":
         # If target is CPU, no need to move anything
         yield module
         return
 
+    # ------【权重加载】记录原始设备与 UVA offload 参数名，供 finally 阶段还原 ------
     original_device_states: dict[str, torch.device] = {}
     uva_offloaded_parameters: list[str] = []
 
+    # ------【权重加载】把仍在 CPU 的参数搬到目标设备，供量化/重打包在设备上处理 ------
     # Store original device states and move parameters to GPU if they're on CPU
     for name, p in module.named_parameters():
         if p.device.type == "cpu":
@@ -171,20 +190,24 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
             uva_offloaded_parameters.append(name)
         # Parameters already on target device are not touched
 
+    # ------【权重加载】上下文管理器主体：yield 期间模块参数停留在目标设备 ------
     try:
         yield module
 
     finally:
+        # ------【权重加载】按环境变量决定是否 pin_memory 加速 CPU 侧访问 ------
         use_pin_memory = (
             is_pin_memory_available()
             and not envs.VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY
         )
+        # ------【权重加载】还原参数到原始设备，忽略期间新创建的参数 ------
         # Restore parameters to their original devices, ignoring new parameters
         for name, p in module.named_parameters():
             if name in original_device_states:
                 original_device: torch.device = original_device_states[name]
                 p.data = p.data.to(original_device)
 
+            # ------【权重加载】UVA offload 参数被替换后重新 offload 回 CPU 并恢复标志 ------
             # parameter is UVA offloaded, but was replaced with a new device tensor
             # re-offload it to CPU using UVA
             if name in uva_offloaded_parameters and not getattr(
@@ -204,13 +227,16 @@ _MODEL_ARCH_BY_HASH = dict[int, tuple[type[nn.Module], str]]()
 def _get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module], str]:
     from vllm.model_executor.models.adapters import as_embedding_model, as_seq_cls_model
 
+    # ------【核心逻辑】从 HF 配置读取 architectures 列表，供解析模型实现类 ------
     architectures = getattr(model_config.hf_config, "architectures", None) or []
 
+    # ------【核心逻辑】通过 registry 按架构名解析出 vLLM 模型类与架构字符串 ------
     model_cls, arch = model_config.registry.resolve_model_cls(
         architectures,
         model_config=model_config,
     )
 
+    # ------【核心逻辑】无 vLLM 实现时回退到 Transformers 后端并告警性能损失 ------
     if arch == model_config._get_transformers_backend_cls():
         assert model_config.model_impl != "vllm"
         if model_config.model_impl == "auto":
@@ -221,6 +247,7 @@ def _get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module],
                 arch,
             )
 
+    # ------【核心逻辑】按 convert_type 决定是否包装为 embedding/分类模型 ------
     convert_type = model_config.convert_type
     if convert_type == "none":
         pass
@@ -237,6 +264,7 @@ def _get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module],
 
 
 def get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module], str]:
+    # ------【核心逻辑】把影响架构解析的配置项哈希成 key，用于进程内缓存去重 ------
     key = hash(
         (
             model_config.model,
@@ -247,9 +275,11 @@ def get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module], 
             tuple(getattr(model_config.hf_config, "architectures", None) or []),
         )
     )
+    # ------【核心逻辑】命中缓存直接返回，省去 registry 查找开销 ------
     if key in _MODEL_ARCH_BY_HASH:
         return _MODEL_ARCH_BY_HASH[key]
 
+    # ------【核心逻辑】未命中则解析并写入缓存，供后续调用复用 ------
     model_cls_and_arch = _get_model_architecture(model_config)
     _MODEL_ARCH_BY_HASH[key] = model_cls_and_arch
     return model_cls_and_arch
@@ -275,10 +305,13 @@ class ParamMapping:
     inverse_packed_mapping: dict[str, tuple[str, int]] = field(default_factory=dict)
 
     def __post_init__(self):
+        # ------【权重加载】遍历 packed 映射，构建 packed 参数到子参数的切片索引 ------
         for packed_name, sub_params in self.packed_mapping.items():
+            # ------【权重加载】跳过自包含项（W_pack 只映射自身），无需建反向索引 ------
             # Skip self-contained cases (e.g., {"W_pack": ["W_pack"]})
             if len(sub_params) == 1 and sub_params[0] == packed_name:
                 continue
+            # ------【权重加载】记录每个子参数所属 packed 参数及其切片下标，供反向查找 ------
             for index, param_name in enumerate(sub_params):
                 self.inverse_packed_mapping[param_name] = (
                     packed_name,
@@ -286,6 +319,7 @@ class ParamMapping:
                 )
 
     def get_sub_modules(self, module_name: str) -> tuple[str, list[str]] | None:
+        # ------【权重加载】按后缀匹配模块名，返回 packed key 与子参数列表 ------
         for key, value in self.packed_mapping.items():
             if module_name.endswith(key):
                 return key, value
@@ -305,12 +339,16 @@ def configure_quant_config(
     Once the `SupportsQuant` mixin has been added to all models, this
     function can be removed
     """
+    # ------【量化】仅对未混入 SupportsQuant 的旧式模型做映射注入 ------
     if not issubclass(model_class, SupportsQuant):
         hf_to_vllm_mapper = getattr(model_class, "hf_to_vllm_mapper", None)
+        # ------【量化】按引用取模型映射表，使量化配置与模型共享同一对象 ------
         packed_mapping = getattr(model_class, "packed_modules_mapping", None)
 
         # pass mappings by reference to quant_config
+        # ------【量化】把 hf->vllm 未堆叠映射注入量化配置，用于权重名匹配 ------
         if hf_to_vllm_mapper is not None:
             quant_config.apply_vllm_mapper(hf_to_vllm_mapper.get_unstacked_mapper())
+        # ------【量化】把 packed_modules_mapping 按引用赋给量化配置，识别融合模块 ------
         if packed_mapping is not None:
             quant_config.packed_modules_mapping = packed_mapping
