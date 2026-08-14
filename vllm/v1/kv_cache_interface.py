@@ -30,6 +30,7 @@ logger = init_logger(__name__)
 # ---------------------------------------------------------------------------
 
 
+# ------【显存 profiling/量化】KVQuantMode：KV cache 量化模式枚举，供 attention backend/kernel 分发量化逻辑，省显存 ------
 class KVQuantMode(IntEnum):
     """KV cache quantization mode.
 
@@ -37,12 +38,19 @@ class KVQuantMode(IntEnum):
     without string matching on ``kv_cache_dtype``.
     """
 
+    # ------【显存 profiling】NONE：不量化，按原始 dtype 存储 ------
     NONE = 0
+    # ------【显存 profiling】FP8_PER_TENSOR：整张量共享一个 fp8 scale（当前 fp8 路径） ------
     FP8_PER_TENSOR = 1  # per-tensor scales (current fp8 path)
+    # ------【显存 profiling】INT8_PER_TOKEN_HEAD：int8 每 token-每 head 动态 scale ------
     INT8_PER_TOKEN_HEAD = 2  # per-token-head dynamic scales for int8
+    # ------【显存 profiling】FP8_PER_TOKEN_HEAD：fp8 每 token-每 head 动态 scale ------
     FP8_PER_TOKEN_HEAD = 3  # per-token-head dynamic scales for fp8
+    # ------【显存 profiling】INT4_PER_TOKEN_HEAD：每字节打包 2×int4，RHT+非对称零点 ------
     INT4_PER_TOKEN_HEAD = 4  # packed 2×int4/byte, RHT + asymmetric zp
+    # ------【显存 profiling】NVFP4：打包 fp4 数据 + fp8 块 scale（Blackwell 专用） ------
     NVFP4 = 5  # packed fp4 data + fp8 block scales
+    # ------【显存 profiling】TURBOQUANT：Hadamard 旋转 + Lloyd-Max 量化，K/V 每 slot 打包 ------
     TURBOQUANT = 6  # Hadamard-rotated Lloyd-Max quant, packed K+V per slot
 
     @property
@@ -65,6 +73,7 @@ class KVQuantMode(IntEnum):
         return self == KVQuantMode.TURBOQUANT
 
 
+# ------【显存 profiling/量化】get_kv_quant_mode：把 kv_cache_dtype 字符串映射为 KVQuantMode 枚举 ------
 def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
     """Map a ``kv_cache_dtype`` string to a :class:`KVQuantMode`."""
     if kv_cache_dtype == "int4_per_token_head":
@@ -82,37 +91,53 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
     return KVQuantMode.NONE
 
 
+# ------【显存 profiling/量化】is_quantized_kv_cache：判断 kv_cache_dtype 是否为量化模式 ------
 def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
     return get_kv_quant_mode(kv_cache_dtype) != KVQuantMode.NONE
 
 
+# ------【显存 profiling/量化】kv_cache_uses_per_token_head_scales：判断是否需要 per-token-head scale ------
 def kv_cache_uses_per_token_head_scales(kv_cache_dtype: str) -> bool:
     """Return True if *kv_cache_dtype* needs per-token-head scales."""
     return get_kv_quant_mode(kv_cache_dtype).is_per_token_head
 
 
+# ------【核心逻辑】KVCacheSpecKind：KV cache spec 类型标签枚举，供引擎按注意力类型分发逻辑 ------
 class KVCacheSpecKind(str, Enum):
+    # ------【核心逻辑】FULL_ATTENTION：全注意力（标准因果注意力） ------
     FULL_ATTENTION = "full_attention"
+    # ------【MLA】MLA_ATTENTION：多头潜在注意力 ------
     MLA_ATTENTION = "mla_attention"
+    # ------【滑动窗口】SLIDING_WINDOW：滑动窗口注意力 ------
     SLIDING_WINDOW = "sliding_window"
+    # ------【滑动窗口/MLA】SLIDING_WINDOW_MLA：滑动窗口 + MLA 组合 ------
     SLIDING_WINDOW_MLA = "sliding_window_mla"
+    # ------【核心逻辑】MAMBA：Mamba 状态空间模型 ------
     MAMBA = "mamba"
+    # ------【chunked prefill】CHUNKED_LOCAL_ATTENTION：分块局部注意力 ------
     CHUNKED_LOCAL_ATTENTION = "chunked_local_attention"
+    # ------【核心逻辑】SINK_FULL_ATTENTION：带 sink token 的全注意力 ------
     SINK_FULL_ATTENTION = "sink_full_attention"
+    # ------【核心逻辑】ENCODER_ONLY_ATTENTION：仅编码器注意力 ------
     ENCODER_ONLY_ATTENTION = "encoder_only_attention"
+    # ------【核心逻辑】CROSS_ATTENTION：交叉注意力（encoder-decoder） ------
     CROSS_ATTENTION = "cross_attention"
+    # ------【核心逻辑】UNKNOWN：未知/混合类型 ------
     UNKNOWN = "unknown"
 
 
+# ------【显存 profiling/核心逻辑】KVCacheSpec：单层 KV cache 布局基类 DTO，Worker 建模层产出→EngineCore/KV cache manager 显存规划 ------
 @dataclass(frozen=True)
 class KVCacheSpec:
     """
     A base class for specifying the KV cache format of one layer.
     """
 
+    # ------【显存 profiling】block_size：一个 block 可容纳的 token 数（页内 token 数） ------
     # number of tokens in a block
     block_size: int
 
+    # ------【显存 profiling】page_size_bytes：单页字节数，抽象方法由子类按布局实现 ------
     @property
     def page_size_bytes(self) -> int:
         """
@@ -123,10 +148,12 @@ class KVCacheSpec:
         """
         raise NotImplementedError
 
+    # ------【MLA/显存 profiling】storage_block_size：实际存储 token 数，默认=block_size，MLA 压缩时除以 compress_ratio ------
     @property
     def storage_block_size(self) -> int:
         return self.block_size
 
+    # ------【显存 profiling】max_memory_usage_bytes：该层 KV cache 最大占用字节数，抽象方法由子类实现 ------
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         """
         The maximum possible memory usage of this KV cache in bytes.
@@ -136,6 +163,7 @@ class KVCacheSpec:
         """
         raise NotImplementedError
 
+    # ------【核心逻辑】max_num_blocks_per_req：单请求所需块表行长度（该 cache group 块表列数） ------
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
         """
         The number of block table entries needed per request, i.e. the row
@@ -148,12 +176,14 @@ class KVCacheSpec:
         """
         return cdiv(max_len, self.block_size)
 
+    # ------【显存 profiling】copy_with_new_block_size：复制自身并替换 block_size（对齐块大小调整） ------
     def copy_with_new_block_size(self, block_size: int) -> Self:
         """
         Create a new KVCacheSpec from self but replacing the block size.
         """
         return replace(self, block_size=block_size)
 
+    # ------【核心逻辑】merge：合并同一 KV cache group 的 spec 列表，要求各层完全一致 ------
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
         """
@@ -164,6 +194,7 @@ class KVCacheSpec:
         )
         return copy.deepcopy(specs[0])
 
+    # ------【核心逻辑】is_uniform_with_collection：本 spec 是否与所有层 spec 同构（用于 uniform 合并判定） ------
     def is_uniform_with_collection(
         self, kv_cache_specs: dict[str, KVCacheSpec]
     ) -> bool:
@@ -180,15 +211,23 @@ class KVCacheSpec:
         )
 
 
+# ------【显存 profiling】AttentionSpec：标准注意力 KV cache 布局 DTO，补充 K/V 头数、head 维度、dtype、量化模式等字段 ------
 @dataclass(frozen=True, kw_only=True)
 class AttentionSpec(KVCacheSpec):
+    # ------【TP/GQA】num_kv_heads：KV 头数（GQA/MQA 下小于 Q 头数，节省 KV 显存） ------
     num_kv_heads: int
+    # ------【显存 profiling】head_size：每个 KV 头的维度 ------
     head_size: int
+    # ------【显存 profiling】dtype：KV cache 存储的 torch dtype ------
     dtype: torch.dtype
+    # ------【显存 profiling/量化】kv_quant_mode：量化模式，默认 NONE 不量化 ------
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE
+    # ------【显存 profiling/对齐】page_size_padded：页字节对齐填充值，None 表示不填充 ------
     page_size_padded: int | None = None
+    # ------【CUDA Graph/打包布局】indexes_kv_by_block_stride：KV 是否按 block 步长索引 ------
     indexes_kv_by_block_stride: bool = False
 
+    # ------【显存 profiling】unpadded_page_size_bytes：未对齐页字节数，per-token-head 量化额外计入 scale 占用 ------
     @property
     def unpadded_page_size_bytes(self) -> int:
         unpadded = self.real_page_size_bytes
@@ -201,6 +240,7 @@ class AttentionSpec(KVCacheSpec):
             )
         return unpadded
 
+    # ------【显存 profiling】page_size_bytes：页字节数，有填充用填充值否则用未对齐值 ------
     @property
     def page_size_bytes(self) -> int:
         if self.page_size_padded is not None:
@@ -208,6 +248,7 @@ class AttentionSpec(KVCacheSpec):
             return self.page_size_padded
         return self.unpadded_page_size_bytes
 
+    # ------【显存 profiling/量化】real_page_size_bytes：按量化模式算 K+V 实际字节（nvfp4/int4 改变 head 维度） ------
     @property
     def real_page_size_bytes(self) -> int:
         if self.kv_quant_mode.is_nvfp4:
@@ -225,12 +266,14 @@ class AttentionSpec(KVCacheSpec):
             * get_dtype_size(self.dtype)
         )
 
+    # ------【PD 分离/DCP】max_num_blocks_per_req：按 decode 上下文并行分片数折算块表行长度 ------
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
         parallel_config = vllm_config.parallel_config
         kv_shard_count = parallel_config.decode_context_parallel_size
         return cdiv(max_len, self.block_size * kv_shard_count)
 
 
+# ------【滑动窗口/核心逻辑】FullAttentionSpec：全注意力层 KV cache spec；混合模型关闭 hybrid allocator 时，滑动窗口层也按全注意力分配块 ------
 @dataclass(frozen=True, kw_only=True)
 class FullAttentionSpec(AttentionSpec):
     """
@@ -242,14 +285,18 @@ class FullAttentionSpec(AttentionSpec):
     In this case, we use FullAttentionSpec and record the sliding window size.
     """
 
+    # ------【MQA/GQA】head_size_v：V 头维度，默认回填为 head_size（MQA 下可不同） ------
     head_size_v: int = None  # type: ignore[assignment]
 
+    # ------【滑动窗口】sliding_window：滑动窗口大小，None 表示不使用滑动窗口 ------
     sliding_window: int | None = None
     """
     Default to None for not using sliding window attention.
     """
+    # ------【chunked prefill】attention_chunk_size：注意力分块大小，用于 chunked local attention ------
     attention_chunk_size: int | None = None
 
+    # ------【chunked prefill/前缀缓存】non_causal：是否非因果注意力（如 Prefix LM），影响调度策略 ------
     non_causal: bool = False
     """
     Whether the layer attends non-causally (e.g. Prefix LM). Carried on the
@@ -259,10 +306,12 @@ class FullAttentionSpec(AttentionSpec):
     cache layout itself.
     """
 
+    # ------【核心逻辑】__post_init__：head_size_v 缺省时回填为 head_size ------
     def __post_init__(self):
         if self.head_size_v is None:
             object.__setattr__(self, "head_size_v", self.head_size)
 
+    # ------【显存 profiling/PD 分离】max_memory_usage_bytes：按最大长度折算页数×页字节；DCP>1 时先除以世界大小 ------
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_model_len = vllm_config.model_config.max_model_len
         dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
@@ -270,6 +319,7 @@ class FullAttentionSpec(AttentionSpec):
             max_model_len = cdiv(max_model_len, dcp_world_size)
         return cdiv(max_model_len, self.block_size) * self.page_size_bytes
 
+    # ------【核心逻辑】merge_window_sizes：合并窗口大小集合，一致返回该值、空返回 None、冲突抛错 ------
     @classmethod
     def merge_window_sizes(cls, window_sizes: set[int]) -> int | None:
         if len(window_sizes) == 0:
@@ -282,6 +332,7 @@ class FullAttentionSpec(AttentionSpec):
                 "same window size."
             )
 
+    # ------【核心逻辑】merge：合并 FullAttentionSpec 列表；窗口/分块须一致，任一非因果则整组视为非因果 ------
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
         """
@@ -332,6 +383,7 @@ class FullAttentionSpec(AttentionSpec):
         )
         return merged_spec
 
+    # ------【显存 profiling/量化】real_page_size_bytes：含 V 头的 K+V 实际字节数，nvfp4/int4 调整维度 ------
     @property
     def real_page_size_bytes(self) -> int:
         if self.kv_quant_mode.is_nvfp4:
@@ -350,6 +402,7 @@ class FullAttentionSpec(AttentionSpec):
         )
 
 
+# ------【显存 profiling/对齐】_apply_alignment_padding：按 alignment 对齐页大小，写入 page_size_padded ------
 def _apply_alignment_padding(spec: MLAAttentionSpec | SlidingWindowMLASpec):
     if spec.alignment is None:
         return
@@ -359,6 +412,7 @@ def _apply_alignment_padding(spec: MLAAttentionSpec | SlidingWindowMLASpec):
         object.__setattr__(spec, "page_size_padded", padded_page_size)
 
 
+# ------【显存 profiling/量化】TQFullAttentionSpec：TurboQuant 感知的全注意力 spec，用 TQ slot 字节算页大小 ------
 @dataclass(frozen=True, kw_only=True)
 class TQFullAttentionSpec(FullAttentionSpec):
     """FullAttentionSpec with TQ-aware page size.
@@ -368,14 +422,17 @@ class TQFullAttentionSpec(FullAttentionSpec):
     head_size * dtype formula.
     """
 
+    # ------【显存 profiling/量化】tq_slot_size：TurboQuant 每 slot 字节数，>0 时覆盖默认页大小公式 ------
     tq_slot_size: int = 0
 
+    # ------【显存 profiling/量化】real_page_size_bytes：TQ slot 大小>0 按 slot 字节算，否则回退父类公式 ------
     @property
     def real_page_size_bytes(self) -> int:
         if self.tq_slot_size > 0:
             return self.block_size * self.num_kv_heads * self.tq_slot_size
         return super().real_page_size_bytes
 
+    # ------【核心逻辑】merge：合并 TQ spec，校验 tq_slot_size 一致后回填 ------
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
         merged = super().merge(specs)
@@ -385,25 +442,34 @@ class TQFullAttentionSpec(FullAttentionSpec):
         return replace(merged, tq_slot_size=specs[0].tq_slot_size)
 
 
+# ------【MLA/显存 profiling】MLAAttentionSpec：MLA 多头潜在注意力 spec，低秩压缩 KV 省显存 ------
 @dataclass(frozen=True, kw_only=True)
 class MLAAttentionSpec(FullAttentionSpec):
     # TODO(Lucas/Chen): less hacky way to do this
+    # ------【显存 profiling/量化】cache_dtype_str：缓存 dtype 字符串（如 fp8_ds_mla），区分自定义 MLA 布局 ------
     cache_dtype_str: str | None = None
     # DeepseekV4 only fields. Non-DeepseekV4 MLA models leave these at defaults.
+    # ------【显存 profiling/对齐】alignment：页字节对齐粒度，None 表示不填充（DeepseekV4 专用） ------
     alignment: int | None = None  # Default to None for no padding.
+    # ------【MLA/显存 profiling】compress_ratio：KV 压缩比，存储块大小为 block_size//compress_ratio ------
     compress_ratio: int = 1  # Default to 1 for no compression.
+    # ------【核心逻辑】model_version：模型版本标记（如 deepseek_v4），区分不同 MLA 布局 ------
     model_version: str | None = None
     # Marks draft groups that flatten a non-causal query block into decode rows.
+    # ------【投机解码】non_causal_multi_token_decode：草稿组是否把非因果 query 块展平成 decode 行 ------
     non_causal_multi_token_decode: bool = False
 
+    # ------【核心逻辑/对齐】__post_init__：父类初始化后按 alignment 对齐页大小 ------
     def __post_init__(self):
         super().__post_init__()
         _apply_alignment_padding(self)
 
+    # ------【MLA/显存 profiling】storage_block_size：实际存储 token 数 = block_size // compress_ratio ------
     @property
     def storage_block_size(self) -> int:
         return self.block_size // self.compress_ratio
 
+    # ------【MLA/显存 profiling】real_page_size_bytes：按 cache_dtype/量化模式算页字节，deepseek_v4 fp8 走 584B/token ------
     @property
     def real_page_size_bytes(self) -> int:
         if self.cache_dtype_str == "fp8_ds_mla":
@@ -425,6 +491,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             * get_dtype_size(self.dtype)
         )
 
+    # ------【核心逻辑】merge：合并 MLA spec，量化/压缩比/版本/块步长须一致 ------
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
         assert all(isinstance(spec, MLAAttentionSpec) for spec in specs), (
@@ -468,6 +535,7 @@ class MLAAttentionSpec(FullAttentionSpec):
         return merged_spec
 
 
+# ------【核心逻辑】HiddenStateCacheSpec：隐藏状态缓存层标记，供 extract_hidden_states 使用 ------
 @dataclass(frozen=True, kw_only=True)
 class HiddenStateCacheSpec(MLAAttentionSpec):
     """Marker for hidden-state cache layers used by extract_hidden_states."""
@@ -475,6 +543,7 @@ class HiddenStateCacheSpec(MLAAttentionSpec):
     pass
 
 
+# ------【滑动窗口/显存 profiling】RSWASpec：Reference 滑动窗口 spec，prefill token 全局可见，只保留最近 rswa_window 生成 token ------
 @dataclass(frozen=True, kw_only=True)
 class RSWASpec(FullAttentionSpec):
     """KV cache spec for Reference Sliding Window Attention (R-SWA).
@@ -486,8 +555,10 @@ class RSWASpec(FullAttentionSpec):
     O(prefix_blocks + window_blocks).
     """
 
+    # ------【滑动窗口/显存 profiling】rswa_window：保留的生成 token 窗口大小，控制显存 O(prefix+window) ------
     rswa_window: int
 
+    # ------【核心逻辑】merge：合并 RSWA spec，rswa_window 须一致，公共字段委托父类合并后回填 ------
     @classmethod
     def merge(cls, specs: list[RSWASpec]) -> RSWASpec:
         assert all(isinstance(spec, RSWASpec) for spec in specs), (
@@ -515,10 +586,13 @@ class RSWASpec(FullAttentionSpec):
         )
 
 
+# ------【chunked prefill/显存 profiling】ChunkedLocalAttentionSpec：分块局部注意力 spec，只保留一个 chunk 窗口的 KV 省显存 ------
 @dataclass(frozen=True, kw_only=True)
 class ChunkedLocalAttentionSpec(AttentionSpec):
+    # ------【chunked prefill】attention_chunk_size：局部注意力窗口大小 ------
     attention_chunk_size: int
 
+    # ------【chunked prefill/显存 profiling】max_admission_blocks_per_request：单请求准入块数=chunk 窗口+在途 token ------
     def max_admission_blocks_per_request(
         self, max_in_flight_tokens: int, max_model_len: int
     ) -> int:
@@ -538,6 +612,7 @@ class ChunkedLocalAttentionSpec(AttentionSpec):
         )
         return cdiv(num_tokens, self.block_size)
 
+    # ------【显存 profiling】max_memory_usage_bytes：按准入块数×页字节算池容量 ------
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_blocks = self.max_admission_blocks_per_request(
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
@@ -545,6 +620,7 @@ class ChunkedLocalAttentionSpec(AttentionSpec):
         )
         return max_blocks * self.page_size_bytes
 
+    # ------【核心逻辑】is_uniform_with_collection：所有层须同为 ChunkedLocalAttentionSpec 且 chunk 大小一致 ------
     def is_uniform_with_collection(
         self, kv_cache_specs: dict[str, KVCacheSpec]
     ) -> bool:
@@ -555,15 +631,20 @@ class ChunkedLocalAttentionSpec(AttentionSpec):
         )
 
 
+# ------【滑动窗口/显存 profiling】SlidingWindowSpec：滑动窗口注意力 spec，只保留最近 sliding_window 个 token 的 KV ------
 @dataclass(frozen=True, kw_only=True)
 class SlidingWindowSpec(AttentionSpec):
+    # ------【滑动窗口】sliding_window：滑动窗口大小 ------
     sliding_window: int
+    # ------【MQA/GQA】head_size_v：V 头维度，缺省回填 head_size ------
     head_size_v: int = None  # type: ignore[assignment]
 
+    # ------【核心逻辑】__post_init__：head_size_v 缺省时回填为 head_size ------
     def __post_init__(self):
         if self.head_size_v is None:
             object.__setattr__(self, "head_size_v", self.head_size)
 
+    # ------【显存 profiling/量化】real_page_size_bytes：含 V 头的页字节，nvfp4 单独处理维度 ------
     @property
     def real_page_size_bytes(self) -> int:
         # Mirror ``FullAttentionSpec.real_page_size_bytes`` for NVFP4 KV cache.
@@ -584,6 +665,7 @@ class SlidingWindowSpec(AttentionSpec):
             * get_dtype_size(self.dtype)
         )
 
+    # ------【滑动窗口/显存 profiling】max_admission_blocks_per_request：准入块数=窗口-1+在途 token，+1 因窗口可不落在块边界 ------
     def max_admission_blocks_per_request(
         self, max_in_flight_tokens: int, max_model_len: int
     ) -> int:
@@ -607,6 +689,7 @@ class SlidingWindowSpec(AttentionSpec):
         # [XXCD][EF] to store the 6-token window [CDEF].
         return cdiv(num_tokens, self.block_size) + 1
 
+    # ------【显存 profiling/PD 分离】max_memory_usage_bytes：滑动窗口不支持 DCP，按准入块数×页字节 ------
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         assert vllm_config.parallel_config.decode_context_parallel_size == 1, (
             "DCP not support sliding window."
@@ -617,6 +700,7 @@ class SlidingWindowSpec(AttentionSpec):
         )
         return max_blocks * self.page_size_bytes
 
+    # ------【核心逻辑】is_uniform_with_collection：所有层须同为 SlidingWindowSpec 且窗口一致 ------
     def is_uniform_with_collection(
         self, kv_cache_specs: dict[str, KVCacheSpec]
     ) -> bool:
@@ -627,23 +711,31 @@ class SlidingWindowSpec(AttentionSpec):
         )
 
 
+# ------【滑动窗口/MLA/显存 profiling】SlidingWindowMLASpec：滑动窗口+MLA 组合 spec，低秩压缩同时限制窗口省显存 ------
 @dataclass(frozen=True, kw_only=True)
 class SlidingWindowMLASpec(SlidingWindowSpec):
     """Sliding window attention with MLA cache format."""
 
+    # ------【显存 profiling/量化】cache_dtype_str：缓存 dtype 字符串（如 fp8_ds_mla） ------
     cache_dtype_str: str | None = None
     # DeepseekV4-only: see MLAAttentionSpec.model_version.
+    # ------【显存 profiling/对齐】alignment：页字节对齐粒度（DeepseekV4 专用） ------
     alignment: int | None = None  # Default to None for no padding.
+    # ------【MLA/显存 profiling】compress_ratio：KV 压缩比 ------
     compress_ratio: int = 1
+    # ------【核心逻辑】model_version：模型版本标记（如 deepseek_v4） ------
     model_version: str | None = None
 
+    # ------【核心逻辑/对齐】__post_init__：按 alignment 对齐页大小 ------
     def __post_init__(self):
         _apply_alignment_padding(self)
 
+    # ------【MLA/显存 profiling】storage_block_size：实际存储 token 数 = block_size // compress_ratio ------
     @property
     def storage_block_size(self) -> int:
         return self.block_size // self.compress_ratio
 
+    # ------【MLA/显存 profiling】real_page_size_bytes：deepseek_v4 fp8 走 584B/token，否则按元素大小公式 ------
     @property
     def real_page_size_bytes(self) -> int:
         if self.model_version == "deepseek_v4" and self.cache_dtype_str == "fp8_ds_mla":
@@ -661,6 +753,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             * get_dtype_size(self.dtype)
         )
 
+    # ------【核心逻辑】merge：合并 SlidingWindowMLA spec，量化/压缩比/版本/窗口/块步长须一致 ------
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
         assert all(isinstance(spec, SlidingWindowMLASpec) for spec in specs), (
@@ -696,6 +789,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             model_version=model_version_set.pop(),
         )
 
+    # ------【核心逻辑】is_uniform_with_collection：所有层须同为 SlidingWindowMLASpec 且窗口一致 ------
     def is_uniform_with_collection(
         self, kv_cache_specs: dict[str, KVCacheSpec]
     ) -> bool:
