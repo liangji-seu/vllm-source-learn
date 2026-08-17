@@ -92,8 +92,8 @@ class CachedRequestState:
 class InputBatch:
     def __init__(
         self,
-        max_num_reqs: int,
-        max_model_len: int,
+        max_num_reqs: int, # 最大req数
+        max_model_len: int, # 每个req的最大kvcache上下文窗口长度
         max_num_batched_tokens: int,
         device: torch.device,
         vocab_size: int,

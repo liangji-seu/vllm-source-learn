@@ -416,6 +416,18 @@ class Scheduler(SchedulerInterface):
                 self.num_lookahead_tokens = self.num_spec_tokens
 
 
+
+
+
+
+
+
+
+
+
+
+
+
         # 构造KVcache管理器
         '''
         KVCacheManager 是 Scheduler 和底层 KV cache 之间的抽象层
@@ -427,17 +439,17 @@ class Scheduler(SchedulerInterface):
 
         self.hash_block_size = hash_block_size
         self.kv_cache_manager = KVCacheManager(
-            kv_cache_config=kv_cache_config,
-            max_model_len=self.max_model_len,
-            max_in_flight_tokens=vllm_config.max_in_flight_tokens,
-            enable_caching=self.cache_config.enable_prefix_caching,
-            use_eagle=self.use_eagle,
+            kv_cache_config=kv_cache_config, # cache配置
+            max_model_len=self.max_model_len, # 模型最大上下文长度
+            max_in_flight_tokens=vllm_config.max_in_flight_tokens, # 最大计算中token
+            enable_caching=self.cache_config.enable_prefix_caching, # 使能前缀缓存
+            use_eagle=self.use_eagle, 
             log_stats=self.log_stats,
-            enable_kv_cache_events=self.enable_kv_cache_events,
+            enable_kv_cache_events=self.enable_kv_cache_events, # 使能时间记录
             dcp_world_size=self.dcp_world_size,
             pcp_world_size=1,
-            scheduler_block_size=self.block_size,
-            hash_block_size=hash_block_size,
+            scheduler_block_size=self.block_size, # block大小
+            hash_block_size=hash_block_size, # hashblock大小
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
         )

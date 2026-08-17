@@ -213,6 +213,39 @@ class AutoWeightsLoader:
         # update default skip_substrs
         self.skip_substrs += self.ROTARY_EMBEDS_UNUSED_WEIGHTS
 
+
+
+
+
+    '''
+    这边的分组参数张量名的方法：
+
+            ① split(".", 1) — 只在第一个点切开，把名字分成「首段」+「剩余」
+
+            "model.layers.0.self_attn.q_proj.weight"
+
+            split(".", 1) → ["model",   "layers.0.self_attn.q_proj.weight"]
+                                ↑首段        ↑剩余（一次性保留，不再切）
+
+---------------------------------------------------------------------------------------------------------------------------
+            ② itertools.groupby — 把「首段相同且连续」的权重归成一组
+
+            注意：groupby 只对相邻相同 key 分组，前提是权重名已按字典序排好。safetensors 文件内部 key 是排序存储的，所以成立。
+    
+---------------------------------------------------------------------------------------------------------------------------    
+            
+            ③ 产出格式：(prefix, (rest, data))
+
+            prefix = 首段（如 "model"）
+            rest = 剩余路径（如 "layers.0.self_attn.q_proj.weight"），若名字没有点则 rest 为 ""
+
+---------------------------------------------------------------------------------------------------------------------------
+
+            所以 _groupby_prefix 的作用 = 把一批权重按「路径第一段」分成一堆堆，供 _load_module 逐级剥洋葱。
+    
+    我们weights迭代器，每次得到的是(name, data), 然后送入这个切分器，输出是(prefix, (left_name, data))
+    '''
+
     def _groupby_prefix(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
@@ -233,6 +266,12 @@ class AutoWeightsLoader:
                 ),
             )
 
+
+
+
+
+
+
     def _get_qualname(self, prefix: str, rest: str) -> str:
         if prefix == "":
             return rest
@@ -251,21 +290,39 @@ class AutoWeightsLoader:
         ius = (qualname.endswith(s) for s in self.ignore_unexpected_suffixes)
         return any(iup) or any(ius)
 
+
+
+
+
+
+
+
+
+    #########################################################
+    # 这里才是真正加载磁盘的权重数据。这里开始吧从磁盘mmap到CPU的张量数据拷贝到GPU
+    #########################################################
     def _load_param(
         self,
-        base_prefix: str,
-        param: nn.Parameter,
-        weights: Iterable[tuple[str, torch.Tensor]],
+        base_prefix: str, # name
+        param: nn.Parameter, # 对应级别的module,去他的实例里面找对应的张量parameter
+        weights: Iterable[tuple[str, torch.Tensor]], # data
     ) -> Iterable[str]:
+
+        # 此时的weight_name = “”， 因为整个名字 model.layers.0.self_attn.q_proj.weight 在递归过程中被一段段剥完了
+        # model、layers、0、self_attn、q_proj 都变成了 base_prefix 的一部分，最后剩的 "weight" 也用来命中了 child_params。
+        # 所以传进来的 child_weights 里 rest 为空 → ("", t)。
         for weight_name, weight_data in weights:
             weight_qualname = self._get_qualname(base_prefix, weight_name)
+            #  # = _get_qualname("model.layers.0.self_attn.q_proj.weight", "")
+            # = "model.layers.0.self_attn.q_proj.weight"    （rest=="" → 返回 prefix）
 
             if self._can_skip(weight_qualname):
                 logger.debug("Skipping weight %s", weight_qualname)
 
                 continue
 
-            if weight_name != "":
+            # 此时的weights迭代对象已经被切成了("", data)
+            if weight_name != "": 
                 if self._can_ignore_unexpected(weight_qualname):
                     logger.debug("Ignoring weight %s", weight_qualname)
 
@@ -276,12 +333,28 @@ class AutoWeightsLoader:
                     f"into a single parameter {base_prefix!r}"
                 )
 
+            ##################################################
+            # 1. 这里开始在weights里面遍历查找param
+            ##################################################
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, weight_data)
+            weight_loader(param, # 对应级别的module,去他的实例里面找对应的张量parameter
+                          weight_data) # （data）
 
             logger.debug("Loaded weight %s with shape %s", weight_qualname, param.shape)
 
             yield weight_qualname
+
+
+
+
+
+
+
+
+
+
+
+
 
     def _add_loadable_non_param_tensors(
         self, module: nn.Module, child_params: dict[str, torch.Tensor]
@@ -313,17 +386,29 @@ class AutoWeightsLoader:
             for stat_name in ("running_mean", "running_var", "num_batches_tracked"):
                 child_params[stat_name] = module_state_dict[stat_name]
 
+
+
+
+
+
+
+
+
+
+
+
     def _load_module(
         self,
-        base_prefix: str,
-        module: nn.Module,
-        weights: Iterable[tuple[str, torch.Tensor]],
+        base_prefix: str,  # = ""
+        module: nn.Module, # =module = Qwen2ForCausalLM实例对象
+        weights: Iterable[tuple[str, torch.Tensor]], # 传进来的weights是一个迭代器，（张量名称，张量）
     ) -> Iterable[str]:
         if isinstance(module, (StageMissingLayer, PPMissingLayer)):
             return
 
         # Avoid infinite recursion since this function is typically
         # called inside load_weights of the module itself
+        # 这个分支不走
         if module != self.module:
             module_load_weights = getattr(module, "load_weights", None)
             if callable(module_load_weights):
@@ -338,14 +423,72 @@ class AutoWeightsLoader:
                         loaded_params,
                     )
 
-        child_modules = dict(module.named_children())
+
+
+
+
+
+        '''
+        named_children()方法是遍历模块内部维护的一个字典：self._modules
+
+        这个字典是是nn.Module.__setattr__在赋值的时候自动填充的。所以当你给一个模块属性赋一个
+        nn.Module的时候，就自动加上了，简单说就是继承nn.Module的类
+
+
+
+        named_parameters()方法，遍历的是_parameters，也就是参数
+        简单说就是self.xxx是继承的nn.Parameter
+        '''
+
+        ##############################################################################
+        # 1. 先保存本module的下一级目录容器有哪些，以及当前目录容器里面的张量参数有哪些
+        ##############################################################################
+        child_modules = dict(module.named_children()) # 当前的module实例的子模块
+        # 如果是Qwen2ForCausalLM， 那么child_modules = 
+        #                   ("model", Qwen2Model)、("lm_head", ParallelLMHead)
+
+
         child_params = dict(module.named_parameters(recurse=False))
 
         # Add missing tensors the weight loader needs to be able to load
         # that aren't registered as params, e.g., batchnorm statistics.
-        self._add_loadable_non_param_tensors(module, child_params)
+        self._add_loadable_non_param_tensors(module, child_params) # 不要作为参数的张量
 
-        for child_prefix, child_weights in self._groupby_prefix(weights):
+
+
+        '''
+            weights 的每个元素就是一个元组 (str, torch.Tensor)。只能顺序遍历一次，不能 weights[0] 索引，不能 .keys()
+
+            它实际吐出来的序列（以 Qwen2.5-0.5B 为例，形状示意）
+
+            ("model.embed_tokens.weight",                    Tensor[vocab=151936, hidden=896])
+            ("model.layers.0.input_layernorm.weight",        Tensor[896])
+            ("model.layers.0.mlp.down_proj.weight",          Tensor[896, 4864])
+            ("model.layers.0.mlp.gate_proj.weight",          Tensor[4864, 896])
+            ("model.layers.0.mlp.up_proj.weight",            Tensor[4864, 896])
+            ("model.layers.0.post_attention_layernorm.weight", Tensor[896])
+            ("model.layers.0.self_attn.k_proj.bias",         Tensor[128])
+            ("model.layers.0.self_attn.k_proj.weight",       Tensor[128, 896])
+            ("model.layers.0.self_attn.o_proj.weight",       Tensor[896, 896])
+            ("model.layers.0.self_attn.q_proj.bias",         Tensor[896])
+            ("model.layers.0.self_attn.q_proj.weight",       Tensor[896, 896])
+            ("model.layers.0.self_attn.v_proj.bias",         Tensor[128])
+            ("model.layers.0.self_attn.v_proj.weight",       Tensor[128, 896])
+            ("model.layers.1.input_layernorm.weight",        ...)   ← 第 1 层，同样 13 个
+            ...  （共 24 层，每层同样的结构重复）
+            ("model.norm.weight",                            Tensor[896])
+            ("lm_head.weight",                               Tensor[151936, 896])
+        '''
+
+
+        ##############################################################################
+        # 2. 这边开始递归 切 磁盘读取的safetensor的权重名，直到切到最后一层，读出这个权重张量
+        #############################################################################
+
+        # (prefix, (left_name, data))
+        for child_prefix, child_weights in self._groupby_prefix(weights): # 切分我们的每一个权重参数
+            # 开始切分第一种头：model + (laysers.0.self_attn.q_proj.weight),("embed_tokens.weight"),.....,
+            # child_prefix 就是第一种开头 model, child_weights就是这个child_prefix开头的属性权重
             prefix = self._get_qualname(base_prefix, child_prefix)
 
             if child_prefix in child_modules:
@@ -354,17 +497,31 @@ class AutoWeightsLoader:
 
                     continue
 
+                ######################################################## 如果还是模块就继续递归 _load_module
                 yield from self._load_module(
-                    prefix, child_modules[child_prefix], child_weights
+                    prefix, child_modules[child_prefix], child_weights # _load_module(prefix = 这一级的前缀， child_modules[child_prefix] = 这一级下的子模块， child_weights= 这个子模块的权重)
                 )
+
+            
+            '''
+                第 5 帧（终点，翻转）
+                    base_prefix = "model.layers.0.self_attn.q_proj"
+                    module = ColumnParallelLinear
+                    权重名字变成 "weight"
+            '''
+
             elif child_prefix in child_params:
                 if self._can_skip(prefix):
                     logger.debug("Skipping param %s", prefix)
 
                     continue
 
-                yield from self._load_param(
-                    prefix, child_params[child_prefix], child_weights
+                #（prefix = name, data）
+                ###################################################################### 终于递归到张量参数W了
+                yield from self._load_param( # 开始加载这最后一级的张量权重
+                    prefix,  # "model.layers.0.self_attn.q_proj.weight"
+                    child_params[child_prefix], # 对应级别的module,去他的实例里面找对应的张量parameter
+                    child_weights # data
                 )
             else:
                 can_skip_module = self._can_skip(prefix + ".")
@@ -393,6 +550,46 @@ class AutoWeightsLoader:
                 )
                 raise ValueError(msg)
 
+
+
+
+
+
+
+    # 开始加载权重
+    '''
+    这里先来展示一下weights这个safetensors的迭代对象
+
+    weights 的每个元素就是一个元组 (str, torch.Tensor)。只能顺序遍历一次，不能 weights[0] 索引，不能 .keys()
+
+            它实际吐出来的序列（以 Qwen2.5-0.5B 为例，形状示意）
+
+            ("model.embed_tokens.weight",                    Tensor[vocab=151936, hidden=896])
+            ("model.layers.0.input_layernorm.weight",        Tensor[896])
+            ("model.layers.0.mlp.down_proj.weight",          Tensor[896, 4864])
+            ("model.layers.0.mlp.gate_proj.weight",          Tensor[4864, 896])
+            ("model.layers.0.mlp.up_proj.weight",            Tensor[4864, 896])
+            ("model.layers.0.post_attention_layernorm.weight", Tensor[896])
+            ("model.layers.0.self_attn.k_proj.bias",         Tensor[128])
+            ("model.layers.0.self_attn.k_proj.weight",       Tensor[128, 896])
+            ("model.layers.0.self_attn.o_proj.weight",       Tensor[896, 896])
+            ("model.layers.0.self_attn.q_proj.bias",         Tensor[896])
+            ("model.layers.0.self_attn.q_proj.weight",       Tensor[896, 896])
+            ("model.layers.0.self_attn.v_proj.bias",         Tensor[128])
+            ("model.layers.0.self_attn.v_proj.weight",       Tensor[128, 896])
+            ("model.layers.1.input_layernorm.weight",        ...)   ← 第 1 层，同样 13 个
+            ...  （共 24 层，每层同样的结构重复）
+            ("model.norm.weight",                            Tensor[896])
+            ("lm_head.weight",                               Tensor[151936, 896])
+
+    1. 名字是点分路径字符串，就是 safetensors 文件里的 key，按字典序排好。
+    2. 张量是 mmap 视图：safe_open + get_tensor 返回的 tensor 只是「形状头 + 指向文件内存的指针」，字节还没真正读进内存。你 copy_ 它时才触发 page fault 读磁盘。
+    3. 单趟流式：遍历一遍就消费完，这也是为什么整个加载过程不把所有权重一次性堆在内存里。   
+            
+
+    这里开始调用一个自动权重加载器 AutoWeightsLoader的load_weights的方法，传入这个weights的mmap对象。
+
+    '''
     @support_quantized_model_reload_from_hp_weights
     def load_weights(
         self,
@@ -401,7 +598,7 @@ class AutoWeightsLoader:
         mapper: WeightsMapper | None = None,
     ) -> set[str]:
         # Ignore unexpected biases (typically from GPTQ models)
-        self.ignore_unexpected_suffixes.append(".bias")
+        self.ignore_unexpected_suffixes.append(".bias") # 忽略找不到对应参数的.bias的权重
 
         # Many models store quant_config in the base model instead of the causal model.
         # We look at the causal model's direct children for this reason.
@@ -416,11 +613,23 @@ class AutoWeightsLoader:
         if mapper is not None:
             weights = mapper.apply(weights)
         # filter out weights with first-prefix/substr to skip in name
+
+        ###########################################
+        # 1. 把我们迭代器里面的权重数据，打包成（name, data）,其中data是mmap的内存指针
+        ##########################################
         weights = (
             (name, weight) for name, weight in weights if not self._can_skip(name)
         )
 
+
+        # 这里的_load_module 才是通过mmap触发page fault， 从磁盘里面读取字节进入内存
+        #################################################
+        # 2. 开始从模块开始递归加载，知道递归到参数，才读取
+        # self.module 是 Qwen2ForCausalLM的模型实例，是一个神经网络容器，模块
+        # weights是迭代器对象，每一条是（name, data）
+        #################################################
         autoloaded_weights = set(self._load_module("", self.module, weights))
+        # 这里的self.module就是整个模型的实例，也就是Qwen2ForCausalLM的实例对象
         return autoloaded_weights
 
 
@@ -723,7 +932,9 @@ def collect_children(
             if isinstance(module_, targets):
                 children_names.append(name)
 
-
+########################################################
+# 这个是用来构造cpu侧meta设备的权重参数张量
+########################################################
 @contextmanager
 def no_init_weights(
     module: nn.Module,
@@ -769,7 +980,7 @@ def no_init_weights(
 class LayerFn(Protocol):
     def __call__(self, prefix: str) -> torch.nn.Module: ...
 
-
+# 这个torch.nn.Identity本身就是 nn.Module的子类
 class PPMissingLayer(torch.nn.Identity):
     """
     A placeholder layer for missing layers in a pipeline parallel model.

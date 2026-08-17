@@ -244,10 +244,10 @@ def memory_profiling(
         and distributed environment, which may consume some memory. This part is not
         included in the weights_memory because PyTorch does not control it.
 
-    The memory in one GPU can be classified into 3 categories:
-    1. memory used by anything other than the current vLLM instance.
-    2. memory used by torch in the current vLLM instance.
-    3. memory used in the current vLLM instance, but not by torch.
+    The memory in one GPU can be classified into 3 categories: 一个GPU上的显存可以分成3类
+    1. memory used by anything other than the current vLLM instance. vllm外的其他实例进程使用的显存
+    2. memory used by torch in the current vLLM instance. 当前vllm进程中torch使用的显存（模型权重）
+    3. memory used in the current vLLM instance, but not by torch. 当前vllm中非torch使用的显存（NCCL）
 
     A quantitive example:
 
@@ -265,11 +265,22 @@ def memory_profiling(
     During profiling (peak):
         category 1: 1 GiB
         category 2: 4 GiB (peak activation tensors take 2 GiB)
+            # 这里的峰值激活张量，不是kvcache, 是指的 模型 forward 过程中临时产生的中间计算结果 = 算子层之间的输入输出缓冲区
+            # 因为我们不是kuipa那种一次就一个token直接来，而是多个req一起，有的是prefill阶段，可能中间的输出缓冲区需要(1000, 4096)
+            # 有的是decode阶段，中间缓冲区就只需要(1, 4096), 因此这里的中间缓冲区是要动态申请释放的。
         category 3: 1 GiB (memory used by NCCL + buffers for some attention backends)
+            # 这里的attention backends额外需要的显存缓冲区，比如score的注意力分数，就需要额外存放。所以例如：
+            '''
+            例如：
+                    FlashAttention
+                    softmax临时统计
+                    split reduction buffer
+                    workspace
+            '''
 
     After profiling:
         category 1: 1 GiB
-        category 2: 3 GiB (after garbage-collecting activation tensors)
+        category 2: 3 GiB (after garbage-collecting activation tensors) # 峰值过后，有些缓冲区就被释放了
         category 3: 1 GiB (memory used by NCCL + buffers for some attention backends)
 
     In this case, non-kv cache takes 5 GiB in total, including:

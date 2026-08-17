@@ -180,6 +180,17 @@ class EngineCore:
 
         # ------【进程管理 + 异步 RPC】构造执行器：本地代理 worker 进程，后续经 Future/RPC 驱动 ------
         # Setup Model.
+
+
+
+
+
+
+        # 1. 执行器->worker->设置好NCCL通信组，初始化每个卡的显存空间，然后加载好模型
+
+        ####################################################################################
+        # 1. 构造一个执行器，启动worker，并完成模型构建 + 权重加载
+        ####################################################################################
         self.model_executor = executor_class(vllm_config) # 1. 构造一个执行器类
         self._pooler_config_logged = False
         if executor_fail_callback is not None:
@@ -192,9 +203,21 @@ class EngineCore:
         if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
             self._eep_scale_up_before_kv_init()
 
+
+
+        # 2. 执行器->worker->基于剩余的显存，初始化好kvcache
         # Setup KV Caches and update CacheConfig after profiling.
         # ------【显存 profiling】初始化 KV cache（内部做显存 profiling + 预热），返回配置 ------
+
+        ####################################################################################
+        # 2. 开始做 profiling, 初始化kv cache
+        ####################################################################################
         kv_cache_config = self._initialize_kv_caches(vllm_config) # 驱动执行器去初始化kv cache
+
+
+
+
+
         # ------【结构化输出/grammar】构造结构化输出管理器，编译/管理 grammar bitmask ------
         self.structured_output_manager = StructuredOutputManager(vllm_config) # 结构化输出管理器
 
@@ -215,7 +238,18 @@ class EngineCore:
             kv_cache_config, vllm_config
         )
 
-        self.scheduler: SchedulerInterface = Scheduler( # 3. 构造一个调度器实例
+
+
+
+
+
+
+
+        
+        ####################################################################################
+        # 3. 构造一个调度器实例
+        ####################################################################################
+        self.scheduler: SchedulerInterface = Scheduler( 
             vllm_config=vllm_config,
             kv_cache_config=kv_cache_config,
             structured_output_manager=self.structured_output_manager,
@@ -297,6 +331,19 @@ class EngineCore:
                 hash_block_size, caching_hash_fn
             )
 
+
+
+
+
+
+
+
+
+
+
+
+
+        # 4. 定义好引擎后端执行一步的逻辑
         # ------【PP】选择主循环：有批处理队列走 step_with_batch_queue，否则走 step ------
         # 选择引擎的主循环用哪个函数
         self.step_fn = (
@@ -318,6 +365,9 @@ class EngineCore:
         # environment variable overrides after this point)
         enable_envs_cache()
 
+
+
+    # 初始化kv cache
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
         # 【Worker 初始化 · 阶段 3/3】Initialize KV Cache
@@ -330,9 +380,18 @@ class EngineCore:
         # register all kvcache specs in enginecore process.
         register_all_kvcache_specs(vllm_config)
 
-        # ------【异步 RPC】向 worker 询问模型各层所需的 KV cache spec ------
+
+
+        
         # Get all kv cache needed by the model
-        kv_cache_specs = self.model_executor.get_kv_cache_specs()
+        ############################################################################
+        # 1. 获取各个group的规格
+        ############################################################################
+        kv_cache_specs = self.model_executor.get_kv_cache_specs() # 拿到我们各个group的kvcache的规格
+
+
+
+
 
         # Some layers (e.g. Prefix LM attention) run non-causally and tag their
         # KV cache spec with ``non_causal=True``. The specs are collected here in
@@ -371,8 +430,16 @@ class EngineCore:
             else:
                 # Profiles the peak memory usage of the model to determine how
                 # much memory can be allocated for kv cache.
-                available_gpu_memory = self.model_executor.determine_available_memory()
+
+                ####################################################################################
+                # 2. profiling, 开始测试峰值缓冲区占用下，kvcache能用的显存空间
+                ####################################################################################
+                available_gpu_memory = self.model_executor.determine_available_memory() # 开始测试当前GPU有多少显存可以供给kvcache使用
                 self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]
+
+
+
+
         else:
             # Attention free models don't need memory for kv cache
             available_gpu_memory = [0] * len(kv_cache_specs)
@@ -383,6 +450,9 @@ class EngineCore:
         # Track max_model_len before KV cache config to detect auto-fit changes
         max_model_len_before = vllm_config.model_config.max_model_len
 
+        ################################################################################################################
+        # 3. 根据空闲显存，更新kv cache config配置
+        ################################################################################################################
         kv_cache_configs = get_kv_cache_configs(
             vllm_config, kv_cache_specs, available_gpu_memory
         )
@@ -406,8 +476,20 @@ class EngineCore:
 
         vllm_config.validate_block_size()
 
+
+
+
+
+
         # ------【异步 RPC】下发 KV cache 配置到 worker 分配显存 ------
+
+        ############################################################################################################################################
+        # 4. 开始让执行器通知worker，开始初始化kvcache 的显存空间，开始切分block
+        ############################################################################################################################################
         self.model_executor.initialize_from_config(kv_cache_configs)
+
+
+
         # ------【CUDA Graph】编译/预热模型：捕获 CUDA Graph 供后续 step 回放 ------
         if not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
             self.model_executor.compile_or_warm_up_model()
@@ -439,6 +521,14 @@ class EngineCore:
                 elapsed,
             )
         return scheduler_kv_cache_config
+
+
+
+
+
+
+
+
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         supported_tasks = self.model_executor.supported_tasks
@@ -1596,6 +1686,9 @@ class EngineCoreProc(EngineCore): # 引擎后端进程类是引擎后端类的�
 
 
 
+                ###############################################################################################
+                # 1. 引擎后端进程开始构造enginecoreProc实例
+                ###############################################################################################
                 # 1. 构造引擎后端进程
                 engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
             assert engine_core is not None
@@ -1626,6 +1719,9 @@ class EngineCoreProc(EngineCore): # 引擎后端进程类是引擎后端类的�
             signal.signal(signal.SIGINT, signal_handler)
 
             # ------【核心逻辑】进入主循环，直到 shutdown 或 SystemExit 才返回 ------
+            ###############################################################################################
+            # 2. 引擎后端进程开始进入busy loop
+            ###############################################################################################
             engine_core.run_busy_loop()  # 2. 开始循环运行
 
 

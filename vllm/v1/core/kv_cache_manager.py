@@ -252,6 +252,7 @@ class KVCacheManager:
         #
         # We use nested tuples to ensure the empty KVCacheBlocks is immutable.
         # ------【核心逻辑】预构造不可变的空 KVCacheBlocks，复用对象以减少 GC 开销 ------
+        # 一个全局共享的空对象，凡是还没分配到 block 的新请求（或已算 token 数为 0 时），都直接引用它，而不是每次都 new 一个空 KVCacheBlocks
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )

@@ -49,22 +49,61 @@ def initialize_model(
     # ------【核心逻辑】未显式传入时回退到 vllm_config，统一模型配置来源 ------
     if model_config is None:
         model_config = vllm_config.model_config
+
+
+
+
+
     # ------【核心逻辑】未指定模型类时按架构名解析出 model_class ------
     if model_class is None:
-        model_class, _ = get_model_architecture(model_config)
+        # model_cls = Qwen2ForCausalLM
+        ########################################################
+        # 1. 从我们的配置文件中，解析出我们的模型类名 model_class = Qwen2ForCausalLM
+        ########################################################
+        model_class, _ = get_model_architecture(model_config) # 解析出我们的模型架构，从我们的配置文件中
+
+
+
+
+
+
+
 
     # ------【量化】先把融合模块映射注入量化配置，供加载时匹配 packed 权重 ------
     if vllm_config.quant_config is not None:
         configure_quant_config(vllm_config.quant_config, model_class)
 
     # ------【核心逻辑】反射读取 __init__ 参数名，区分 new-style 与 old-style 模型类 ------
+    '''
+    signatures 签名，就是函数的参数列表
+    signatures = inspect.signature(model_class.__init__)
+    这个就是用python的反射，读取Qwen2ForCausalLM.__init__的参数名
+
+        为什么读签名
+        用来区分新式/旧式模型类的构造方式——因为两类类的 __init__ 参数不同：
+
+        新式（现代 vLLM 写法，:77 命中这条）：
+
+    '''
+    ########################################################
+    # 2. 获取这个模型类的初始化参数列表
+    ########################################################
     signatures = inspect.signature(model_class.__init__)
     all_params = [param.name for param in signatures.parameters.values()]
+
     # ------【核心逻辑】new-style：按 vllm_config+prefix 构造并记录 reload 元数据 ------
+    #     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+    # 所以命中了vllm_config, prefix, 所以进入
     if "vllm_config" in all_params and "prefix" in all_params:
-        # new-style model class
+        # new-style model class 
+        # set_current_vllm_config, 设置全局变量上下文，给构造过程中被处罚的其他的模块用的
+        # set_current_vllm_config = 构造模型期间把 config 挂到全局，让深层的子模块/custom op 能通过 get_current_vllm_config() 隐式读到，避免层层传参
         with set_current_vllm_config(vllm_config, check_compile=True, prefix=prefix):
-            model = model_class(vllm_config=vllm_config, prefix=prefix)
+
+            ####################################################################################
+            # 3. 开始构造Qwen2ForCausalLM模型实例
+            ####################################################################################
+            model = model_class(vllm_config=vllm_config, prefix=prefix) # 调用Qwen2ForCausalLM的构造方法
             record_metadata_for_reloading(model)
             return model
 
@@ -103,6 +142,19 @@ def initialize_model(
         record_metadata_for_reloading(model)
 
     return model
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def process_weights_after_loading(
@@ -223,11 +275,14 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
 _MODEL_ARCH_BY_HASH = dict[int, tuple[type[nn.Module], str]]()
 """Caches the outputs of `_get_model_architecture`."""
 
-
+# 拿到模型架构
 def _get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module], str]:
     from vllm.model_executor.models.adapters import as_embedding_model, as_seq_cls_model
 
     # ------【核心逻辑】从 HF 配置读取 architectures 列表，供解析模型实现类 ------
+    '''
+    从我们指定的模型目录的：config.json里面读取architectures 这个字段的字符串
+    '''
     architectures = getattr(model_config.hf_config, "architectures", None) or []
 
     # ------【核心逻辑】通过 registry 按架构名解析出 vLLM 模型类与架构字符串 ------
@@ -263,13 +318,18 @@ def _get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module],
     return model_cls, arch
 
 
+
+
+
+
+# 拿到我们的模型架构，有哪些算子层，有哪些block
 def get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module], str]:
     # ------【核心逻辑】把影响架构解析的配置项哈希成 key，用于进程内缓存去重 ------
     key = hash(
         (
-            model_config.model,
+            model_config.model, #hf模型路径
             model_config.convert_type,
-            model_config.runner_type,
+            model_config.runner_type,# model_runner类型
             model_config.trust_remote_code,
             model_config.model_impl,
             tuple(getattr(model_config.hf_config, "architectures", None) or []),
@@ -280,7 +340,7 @@ def get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module], 
         return _MODEL_ARCH_BY_HASH[key]
 
     # ------【核心逻辑】未命中则解析并写入缓存，供后续调用复用 ------
-    model_cls_and_arch = _get_model_architecture(model_config)
+    model_cls_and_arch = _get_model_architecture(model_config) # model_cls = Qwen2ForCausalLM
     _MODEL_ARCH_BY_HASH[key] = model_cls_and_arch
     return model_cls_and_arch
 

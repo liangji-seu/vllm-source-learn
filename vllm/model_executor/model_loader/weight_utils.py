@@ -920,8 +920,18 @@ def _prefetch_all_checkpoints(
     threading.Thread(target=_run_prefetch, daemon=True).start()
 
 
+
+
+
+
+
+
+
+
+
+# .safetensors的单线程权重加载迭代器
 def safetensors_weights_iterator(
-    hf_weights_files: list[str],
+    hf_weights_files: list[str], # 权重文件
     use_tqdm_on_load: bool,
     safetensors_load_strategy: str | None = None,
     local_expert_ids: set[int] | None = None,
@@ -941,7 +951,7 @@ def safetensors_weights_iterator(
         loading_desc += " (eager)"
 
     # ------【权重加载】按自然序排分片文件名，保证 shard 0/1/2 而非 0/10/11 的加载顺序 ------
-    sorted_files = sorted(hf_weights_files, key=_natural_sort_key)
+    sorted_files = sorted(hf_weights_files, key=_natural_sort_key) # 排序
 
     # ------【下载缓存】探测 FS 类型、checkpoint 总量与可用内存，判断能否整体装入内存以定预取策略 ------
     fs_type = _get_fs_type(sorted_files)
@@ -1013,8 +1023,18 @@ def safetensors_weights_iterator(
 
     # ------【量化】记录 torchao 跨分片尚未补齐的 tensor 子类数据，供后续分片继续拼接 ------
     leftover_state_dict: dict[str, torch.Tensor] = {}
+
+
+
+
+
+
+
+    ##################################################################
+    # 1. 开始加载权重
+    ##################################################################
     # ------【权重加载】主循环逐分片迭代并显示进度条，按加载策略分发到不同分支 ------
-    for st_file in tqdm(
+    for st_file in tqdm( # 每一个文件
         sorted_files,
         desc=loading_desc,
         disable=not enable_tqdm(use_tqdm_on_load),
@@ -1065,12 +1085,26 @@ def safetensors_weights_iterator(
             yield from unflattened_state_dict.items()
         # ------【权重加载+EP 权重切分】默认路径：safe_open 懒加载逐张量读取并过滤无关 expert 权重 ------
         else:
+
+            ##################################################################
+            # 默认加载每一个.safetensors
+            ##################################################################
+            # safe_open是safetensors的库函数，pt表示是pytorch框架的张量类型。所以返回的是 torch.Tensor
+            # 除此之外还有np = numpy, tf=tensorflow
             with safe_open(st_file, framework="pt") as f:
-                for name in f.keys():  # noqa: SIM118
+                for name in f.keys():  # noqa: SIM118 # 遍历每一个权重名
                     if should_skip_weight(name, local_expert_ids):
                         continue
-                    param = f.get_tensor(name)
-                    yield name, param
+                    param = f.get_tensor(name) # 懒加载mmap出一个权重
+                    yield name, param # 抛出
+
+
+
+
+
+
+
+
 
 
 def multi_thread_safetensors_weights_iterator(
@@ -1362,6 +1396,11 @@ def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:
     return x
 
 
+
+
+######################################################################
+# 这个是实际的拷贝器
+######################################################################
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
     try:
@@ -1378,7 +1417,11 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
                 f"into parameter ({param.size()})"
             )
 
-            param.data.copy_(loaded_weight)
+            ##############################################
+            # param 对应级别的module,去他的实例里面找对应的张量parameter, 这个实例，以及空的张量参数，已经在GPU了
+            # loaded_weight这个是(data), 也就是从权重数据里面，把name全部切成prefix后剩下的空的data
+            ##############################################
+            param.data.copy_(loaded_weight) # 这里拷贝， loaded_weight是mmap出来的CPU张量， param.data是GPU的参数
     except Exception:
         # NOTE: This exception is added for the purpose of setting breakpoint to
         # debug weight loading issues.

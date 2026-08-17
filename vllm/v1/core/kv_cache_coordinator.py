@@ -94,7 +94,8 @@ class KVCacheCoordinator(ABC):
 
         # ------【内存池/CuMem】创建统一内存块池 BlockPool，作为所有组的物理块来源 ------
         self.block_pool = BlockPool(
-            num_gpu_blocks=kv_cache_config.num_blocks,
+            num_gpu_blocks=kv_cache_config.num_blocks, # 所以这里的num_gpu_blocks，是worker在profiling阶段，综合所有group的形状测出来的综合的block数量，
+            #                                                                            不是单一group形状下的块数。
             enable_caching=enable_caching,
             hash_block_size=hash_block_size,
             enable_kv_cache_events=enable_kv_cache_events,
@@ -113,15 +114,15 @@ class KVCacheCoordinator(ABC):
         # ------【核心逻辑】为每个 KV cache 组构建对应的单类型管理器，形成管理链 ------
         self.single_type_managers = tuple(
             get_manager_for_kv_cache_spec(
-                kv_cache_spec=kv_cache_group.kv_cache_spec,
-                max_in_flight_tokens=max_in_flight_tokens,
+                kv_cache_spec=kv_cache_group.kv_cache_spec, #这个group的kvcache的形状
+                max_in_flight_tokens=max_in_flight_tokens, 
                 max_model_len=max_model_len,
-                block_pool=self.block_pool,
-                enable_caching=enable_caching,
-                kv_cache_group_id=i,
+                block_pool=self.block_pool, # 告诉他我们总体的逻辑单卡的block池，供各种类型的group的管理器使用
+                enable_caching=enable_caching, # 这个类型的group需要开启prefix cache
+                kv_cache_group_id=i, # group id ,表示第几种kvcache形状
                 dcp_world_size=dcp_world_size,
                 pcp_world_size=pcp_world_size,
-                scheduler_block_size=self.scheduler_block_size,
+                scheduler_block_size=self.scheduler_block_size, 
                 needs_kv_cache_zeroing=self.kv_cache_config.needs_kv_cache_zeroing,
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
@@ -515,6 +516,13 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         # Single group; useless but just set ``use_eagle`` for consistency regardless.
         # ------【投机解码】将 EAGLE 标记传播到唯一管理器，供命中时丢弃 last-block 使用 ------
         self.single_type_managers[0].use_eagle = 0 in self.eagle_group_ids
+
+
+
+
+
+
+
 
     def find_longest_cache_hit(
         self,

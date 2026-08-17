@@ -166,7 +166,7 @@ class Request:
         # ------【前缀缓存】_prompt_embeds_per_block_hashes：逐块 prompt 嵌入哈希缓存，避免重复哈希 ------
         # Cache per-block prompt-embed hashes to avoid rehashing the same
         # tensor slices when generating extra keys.
-        self._prompt_embeds_per_block_hashes: dict[tuple[int, int], bytes] = {}
+        self._prompt_embeds_per_block_hashes: dict[tuple[int, int], bytes] = {} # 多模态相关的，不要看
         # ------【核心逻辑】num_prompt_tokens：prompt 总 token 数（由 token_ids 或 embeds 推导） ------
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             prompt_token_ids, prompt_embeds

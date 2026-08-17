@@ -124,7 +124,7 @@ def register_model_loader(load_format: str):
 
 def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
     """Get a model loader based on the load format."""
-    load_format = load_config.load_format
+    load_format = load_config.load_format # safetensors
     # ------【核心逻辑】查表前先校验格式是否受支持，给用户明确报错 ------
     if load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
         raise ValueError(f"Load format `{load_format}` is not supported")

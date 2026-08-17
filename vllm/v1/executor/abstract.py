@@ -168,6 +168,13 @@ class Executor(ABC):
         # ------【异步 RPC + 显存 profiling】广播 KV cache 配置，各 Worker 按显存规划初始化 KV cache ------
         self.collective_rpc("initialize_from_config", args=(kv_cache_configs,))
 
+
+
+
+
+
+
+
     def compile_or_warm_up_model(self) -> None:
         """Compile/warm up the model and capture cudagraphs on workers."""
         # ------【CUDA Graph】广播编译/预热命令，各 Worker 编译模型并捕获 CUDA Graph 回传耗时 ------
@@ -197,7 +204,7 @@ class Executor(ABC):
 
     def determine_available_memory(self) -> list[int]:  # in bytes
         # ------【显存 profiling】广播探测各 Worker 可用显存，供 scheduler 规划 KV cache ------
-        return self.collective_rpc("determine_available_memory")
+        return self.collective_rpc("determine_available_memory") # 发送测试可用显存
 
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         # ------【异步 RPC + 显存 profiling】广播到各 Worker 获取 KV cache 规格，用于显存规划 ------

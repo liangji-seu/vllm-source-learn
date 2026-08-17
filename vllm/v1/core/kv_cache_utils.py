@@ -132,7 +132,7 @@ class KVCacheBlock:
     # ------【前缀缓存】块满载后被缓存时记录其哈希键与覆盖 token 数，供前缀匹配使用 ------
     # The hash key (block hash + group id) of the block, only available
     # when the block is full and cached.
-    _block_hash: BlockHashWithGroupId | None = None
+    _block_hash: BlockHashWithGroupId | None = None # 链式hash + groupid
     # Number of prefix tokens covered by _block_hash. For full blocks this is
     # the full block boundary; partial entries can end inside a cache block.
     _block_hash_num_tokens: int | None = None

@@ -301,7 +301,9 @@ class MultiprocExecutor(Executor):
                 self.local_world_size,
             )
 
-
+            ##########################################################################################
+            # 1. 创建发送任务的广播队列
+            ##########################################################################################
             self.rpc_broadcast_mq = MessageQueue( # 创建广播环形缓冲区
                 self.world_size, # 卡数量
                 self.local_world_size, # 节点内卡的数量
@@ -351,6 +353,10 @@ class MultiprocExecutor(Executor):
                 with cpu_omp_manager.configure_omp_envs( # GPU环境下，这个可以跳过
                     rank=global_rank, local_rank=local_rank
                 ):
+
+                    ##########################################################################################
+                    # 2. 创建并启动Worker进程
+                    ##########################################################################################
                     unready_worker_handle = WorkerProc.make_worker_process( # 创建进程实例并启动，还未启动完成
                         vllm_config=self.vllm_config,
                         local_rank=local_rank, # 单卡的单机id
@@ -938,6 +944,12 @@ class WorkerProc:
     ):
         # ------【NCCL 通信】构造 WorkerWrapper 并 init_worker：各 rank 携带自己的初始化参数建立分布式进程组 ------
         self.rank = rank
+
+
+
+        ##########################################################################################
+        # 0. 构建调用转发的中间装饰器 WorkerWrapperBase
+        ##########################################################################################
         wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank) # 构造一个装饰器的实例，用来选择合适的Worker，并解析我们的指令
         # TODO: move `init_worker` to executor level as a collective rpc call
         all_kwargs: list[dict] = [
@@ -952,7 +964,10 @@ class WorkerProc:
             "shared_worker_lock": shared_worker_lock,
         }
 
+        
+        ##########################################################################################
         # 1. 在这里利用wrapper装饰器，构建worker的实例
+        ##########################################################################################
         wrapper.init_worker(all_kwargs) 
         self.worker = wrapper
 
@@ -963,7 +978,10 @@ class WorkerProc:
 
         # ------【进程管理】初始化 GPU 设备上下文：为 ModelRunner 分配设备、创建 runner 实例 ------
         # Load model
+        
+        ##########################################################################################
         # 2. 驱动内部Worker开始init_device, 为GPUModelRunner准备环境， 然后构造model_runner实例
+        ##########################################################################################
         self.worker.init_device()
 
 
@@ -977,6 +995,11 @@ class WorkerProc:
             self.worker.elastic_ep_execute("load_model")
         else:
             # 驱动Worker开始load_model(), 获得了self.model, 还在外面包了一层cuda graph
+
+
+            ##########################################################################################
+            # 3. 驱动Worker开始load_model(), 获得了self.model,完成模型实例构建 + 权重加载
+            ##########################################################################################
             self.worker.load_model()
 
 
@@ -1013,6 +1036,20 @@ class WorkerProc:
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
         enable_envs_cache()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
     # 工厂函数，返回一个未启动的worker进程实例
@@ -1272,6 +1309,15 @@ class WorkerProc:
 
             # ------【异步 RPC】进入主循环：持续 dequeue 广播指令、执行、回写结果 ------
             worker.worker_busy_loop() # 开始进入工作循环
+
+
+
+
+
+
+
+
+
 
         # ------【进程管理】异常兜底：worker 启动/运行失败时置位关闭标志，避免 ZMQ 析构时二次抛异常 ------
         except Exception:

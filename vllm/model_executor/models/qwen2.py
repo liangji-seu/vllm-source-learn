@@ -370,10 +370,12 @@ class Qwen2Model(nn.Module, EagleModelMixin):
                 prefix=f"{prefix}.embed_tokens",
             )
         else:
+            # embedding nn.Module
             self.embed_tokens = PPMissingLayer()
 
+        # nn.Module
         self.start_layer, self.end_layer, self.layers = make_layers(
-            config.num_hidden_layers,
+            config.num_hidden_layers, # 层数
             lambda prefix: decoder_layer_type(
                 config=config,
                 cache_config=cache_config,
@@ -387,6 +389,7 @@ class Qwen2Model(nn.Module, EagleModelMixin):
             ["hidden_states", "residual"], config.hidden_size
         )
         if get_pp_group().is_last_rank:
+            # RMSNorm nn.Module
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
@@ -438,6 +441,14 @@ class Qwen2Model(nn.Module, EagleModelMixin):
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
+'''
+Qwen2ForCausalLM   (最外层入口，唯一注册)
+  └── Qwen2Model      整个主干 = embed_tokens + N × DecoderLayer
+        └── Qwen2DecoderLayer   一个 transformer block
+              ├── Qwen2Attention  多头注意力（Q/K/V/O + RoPE）
+              └── Qwen2MLP        FFN（gate/up/down + 激活）
+
+'''
 class Qwen2ForCausalLM(
     nn.Module, SupportsLoRA, SupportsPP, SupportsEagle, SupportsEagle3, SupportsQuant
 ):
@@ -455,12 +466,15 @@ class Qwen2ForCausalLM(
         self.config = config
 
         self.quant_config = quant_config
-        self.model = Qwen2Model(
+
+        # 模型，nn.Module
+        self.model = Qwen2Model( # 这是一个子模型，Qwen2Model继承nn.Module
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
 
         if get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
+                # lm_head ->embedding  nn.Module
                 self.lm_head = self.model.embed_tokens
             else:
                 self.lm_head = ParallelLMHead(
@@ -470,8 +484,10 @@ class Qwen2ForCausalLM(
                     prefix=maybe_prefix(prefix, "lm_head"),
                 )
         else:
+            
             self.lm_head = PPMissingLayer()
 
+        # 打分处理器（sampler之前，lm_head之后的一部分） nn.Module
         self.logits_processor = LogitsProcessor(config.vocab_size)
 
         self.make_empty_intermediate_tensors = (
@@ -500,9 +516,19 @@ class Qwen2ForCausalLM(
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
+
+    # 开始流式加载迭代器的权重
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+
+        ##################################################################
+        # 1. 构建一个AutoWeightsLoader实例
+        ##################################################################
         loader = AutoWeightsLoader(
             self,
-            skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
+            skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None), # 共用embedding的权重
         )
+
+        ##################################################################
+        # 2. 开始加载迭代器的权重数据
+        ##################################################################
         return loader.load_weights(weights)

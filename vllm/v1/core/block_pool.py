@@ -181,8 +181,8 @@ class BlockPool:
         self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
 
         # Cache for block lookup
-        self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
-        self.cached_block_hashes_by_block: dict[int, set[BlockHashWithGroupId]] = {}
+        self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap() # 正向块hash映射表
+        self.cached_block_hashes_by_block: dict[int, set[BlockHashWithGroupId]] = {} # 反向块hash映射表
 
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to

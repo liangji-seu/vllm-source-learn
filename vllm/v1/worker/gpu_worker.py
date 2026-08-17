@@ -139,6 +139,9 @@ class Worker(WorkerBase):
         is_driver_worker: bool = False,
     ):
         # ------【进程管理】先走父类 WorkerBase 构造，把 rank/local_rank/init_method 等分布式身份保存好 ------
+        ##########################################################################################
+        # 1. 先构建Worker功能实例
+        ##########################################################################################
         super().__init__(
             vllm_config=vllm_config,
             local_rank=local_rank,
@@ -337,6 +340,24 @@ class Worker(WorkerBase):
             restore = original_value if original_value else str(_SIZE_MAX_MB)
             torch._C._accelerator_setAllocatorSettings(f"max_split_size_mb:{restore}")
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     @instrument(span_name="Init device")
     def init_device(self):
         # 【Worker 初始化 · 阶段 1/3】Init Device
@@ -374,6 +395,7 @@ class Worker(WorkerBase):
             # such as NIC affinity and P2P checks.
             # assigned_physical_gpu_ids 是一张「逻辑 id → 物理卡」的映射表, 是本机节点运行用的物理GPU列表，按照下标和local_rank对应
             # 逻辑id是self.local_rank
+
             assigned_physical_gpu_ids = parallel_config.assigned_physical_gpu_ids
             if assigned_physical_gpu_ids is not None:
                 from vllm.platforms.interface import set_assigned_physical_gpu_ids
@@ -412,6 +434,9 @@ class Worker(WorkerBase):
 
             # ------【进程管理】把逻辑 local_rank 换算成真正写给 PyTorch 的物理卡号，并设为本进程当前设备 ------
             # visible_device_index 是「最终真正写给 PyTorch 的物理卡号」，作用就一个：决定 self.device 到底是哪张卡，并让 torch 把这张卡设成当前设备
+            ###########################################################################
+            # 1. 绑定物理GPU卡
+            ###########################################################################
             visible_device_index = (
                 current_platform.logical_device_id_to_visible_device_id(self.local_rank)
             )
@@ -441,6 +466,10 @@ class Worker(WorkerBase):
             # available memory
             # ------【NCCL 通信】先初始化分布式环境确保 NCCL 缓冲已分配，再切分 TP/PP/CP 子组 ------
             # 拉起NCCL通信网络，这是一个包装器，做点切分TP/PP/CP分组这些
+
+            ###########################################################################
+            # 2. 拉起NCCL通信网络
+            ###########################################################################
             init_worker_distributed_environment(
                 self.vllm_config,
                 self.rank,
@@ -472,6 +501,12 @@ class Worker(WorkerBase):
             torch.accelerator.empty_cache()
 
             # take current memory snapshot
+            # 这个MemorySnapshot类，就是一个内存快照类，封装了一些torch的方法，来快速获得当前显存的情况
+            
+
+            ############################################################
+            # 3. 创建内存拍照器，计算可用显存目标值
+            ############################################################
             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device) # 测量还有多少显存
             # ------【显存 profiling】按 gpu_memory_utilization 算出「打算用多少显存」的预算目标值 ------
             # 这个就是用户设置显存使用比例的地方
@@ -523,12 +558,40 @@ class Worker(WorkerBase):
             )
 
             # Worker构造modelrunner v1实例
+
+
+            ############################################################
+            # 4. 构建model runner
+            ############################################################
             self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
 
         # ------【核心逻辑】rank0 负责收集并上报使用统计信息（可开关）──
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     def handle_ft_command(self, ft_request):
         # ------【进程管理】容错模式下的控制命令统一转发给哨兵处理 ------
@@ -564,7 +627,7 @@ class Worker(WorkerBase):
             # 20 MiB is the minimum PyTorch allows for max_split_size_mb.
             self._scoped_allocator_max_split(max_split_size_mb=20),# ③ 临时调 allocator 参数
         ):
-            self.model_runner.load_model(load_dummy_weights=load_dummy_weights) # 真正加载权重
+            self.model_runner.load_model(load_dummy_weights=load_dummy_weights) # 构造模型实例 + 加载权重
 
         # ------【异步 RPC】可选的多机权重传输：为跨机热更新/加载权重建立传输引擎 ------
         # 多机权重转移的逻辑
@@ -594,13 +657,16 @@ class Worker(WorkerBase):
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.reload_weights(*args, **kwargs)
 
+    ########################################################
+    # profiling的方法实现
+    ########################################################
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
         memory can be used for KV cache without OOMs.
 
-        The engine will first conduct a profiling of the existing memory usage.
-        Then, it calculates the free memory that can be used for KV cache in
+        The engine will first conduct a profiling of the existing memory usage. 先测试已存在的显存使用
+        Then, it calculates the free memory that can be used for KV cache in 计算空闲的可以用于kvcache的显存空间
         bytes.
 
         Tip:
@@ -611,10 +677,11 @@ class Worker(WorkerBase):
         maybe_apply_startup_plan(self)
 
         # ------【显存 profiling】用户手动指定 kv_cache_memory_bytes：跳过自动测量，直接按该值预留 ------
+        # 跳过
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
-            self.model_runner.profile_run()
+            self.model_runner.profile_run() 
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
@@ -638,11 +705,17 @@ class Worker(WorkerBase):
         # ------【显存 profiling】用假输入跑一次前向，实测模型权重+激活峰值，作为 KV cache 预算的依据 ------
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
+        # 之前没有指定过线程，我们自己profiling
+        # 这里是上下文管理器，用来记录这个期间的profiling的输出结果
+        ################################################################################################################
+        # worker开始指挥 model_runner 进行 profile 测试
+        ################################################################################################################
         with memory_profiling(
-            self.init_snapshot,
-            weights_memory=int(self.model_runner.model_memory_usage),
+            self.init_snapshot, # 内存拍照实例
+            # 在此之前model_runner已经加载完了model
+            weights_memory=int(self.model_runner.model_memory_usage), 
         ) as profile_result:
-            self.model_runner.profile_run()
+            self.model_runner.profile_run() # 开始测试运行
 
         # Profile CUDA graph memory if graphs will be captured.
         # ROCm is included: #44825 moved the profiler to
@@ -687,6 +760,9 @@ class Worker(WorkerBase):
             "isolate vLLM in its own container."
         )
         # ------【显存 profiling】可给 KV cache 的显存 = 预算 - 非 KV 占用 - CUDA graph 池估算 ------
+        ################################################################################################################
+        # 计算kvccache可用显存
+        ################################################################################################################
         self.available_kv_cache_memory_bytes = (
             self.requested_memory
             - profile_result.non_kv_cache_memory
@@ -759,6 +835,26 @@ class Worker(WorkerBase):
             getattr(self.parallel_config, "_api_process_count", 1),
         )
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     def get_kv_connector_handshake_metadata(
         self,
     ) -> dict[tuple[int, int], KVConnectorHandshakeMetadata] | None:
@@ -800,6 +896,14 @@ class Worker(WorkerBase):
             self.model_runner.update_max_model_len(max_model_len)
         logger.debug("Updated max_model_len to %d", max_model_len)
 
+
+
+
+
+
+
+
+
     @instrument(span_name="Allocate KV cache")
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
@@ -807,7 +911,10 @@ class Worker(WorkerBase):
         # ------【显存 profiling】用 profiling 后调整好的块数回填本地配置，供 warmup 阶段使用 ------
         # Update local config with adjusted num blocks after profiling,
         # so that it's available to the warmup stage.
-        self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
+        ############################################################################################
+        # 把单层可用的block数更新上去
+        ############################################################################################
+        self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks 
 
         # ------【PD 分离】初始化 KV connector，让 prefill/decode 实例之间能跨机搬运 KV cache ------
         # Init kv cache connector here, because it requires
@@ -818,8 +925,17 @@ class Worker(WorkerBase):
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
 
         # ------【显存 profiling】在 KV cache 内存池上下文中真正分配 KV cache 张量 ------
+        ############################################################################################
+        # 开始正式通知model_runner来初始化显存，把他全部占用，申请成tensor
+        ############################################################################################
         with self._maybe_get_memory_pool_context(tag="kv_cache"):
             self.model_runner.initialize_kv_cache(kv_cache_config)
+
+
+
+
+
+
 
         # ------【EP/EPLB】开启返回路由专家时，初始化专家捕获器（用于弹性 EP 动态扩缩容）──
         if self.model_config.enable_return_routed_experts:
@@ -833,6 +949,17 @@ class Worker(WorkerBase):
             self.model_runner, "_init_kv_zero_meta"
         ):
             self.model_runner._init_kv_zero_meta()
+
+
+
+
+
+
+
+
+
+
+
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:

@@ -39,22 +39,42 @@ class BaseModelLoader(ABC):
         inplace weights loading for an already-initialized model"""
         raise NotImplementedError
 
+
+
+
+
+
+
+
+
+
+
+
+
+
     @instrument(span_name="Load model")
     def load_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
     ) -> nn.Module:
         """Load a model with the given configurations."""
-        device_config = vllm_config.device_config
+        device_config = vllm_config.device_config # cuda
         load_config = vllm_config.load_config
         # ------【显存 profiling】权重加载设备优先取 load_config，否则回退到 device_config ------
-        load_device = (
+        load_device = ( # cuda
             device_config.device if load_config.device is None else load_config.device
         )
+
+        ##################################################################################
+        # 1. 指定我们的模型所在设备
+        ##################################################################################
         target_device = torch.device(load_device)
         # ------【核心逻辑】在指定 dtype 与设备上下文下初始化空模型（meta 设备零初始化） ------
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
-                model = initialize_model(
+                ####################################################################################
+                # 2. 开始构造Qwen2ForCausalLM模型实例
+                ####################################################################################
+                model = initialize_model( 
                     vllm_config=vllm_config,
                     model_config=model_config,
                     prefix=prefix,
@@ -65,6 +85,9 @@ class BaseModelLoader(ABC):
 
             # ------【权重加载】调用子类实现把权重灌入刚初始化的模型 ------
             logger.debug("Loading weights on %s ...", load_device)
+            ###############################################################
+            # 3. 开始加载权重
+            ###############################################################
             self.load_weights(model, model_config)
 
             # ------【显存 profiling】CUDA/XPU 上记录加载权重后的峰值显存，用于在线量化测试覆盖 ------
@@ -87,7 +110,17 @@ class BaseModelLoader(ABC):
             process_weights_after_loading(model, model_config, target_device)
 
         # ------【核心逻辑】把模型置为 eval 模式后返回，完成加载主流程 ------
+        ###############################################################
+        # 把这个模型设置成推理模式，返回
+        ###############################################################
         return model.eval()
+
+
+
+
+
+
+
 
 
 def log_model_inspection(model: nn.Module) -> None:

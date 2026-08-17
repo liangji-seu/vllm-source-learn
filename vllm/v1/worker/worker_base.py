@@ -62,6 +62,9 @@ class WorkerBase:
             is_driver_worker: Whether this worker handles driver
                 responsibilities
         """
+        ###########################################################################
+        # 1. 先保存配置文件
+        ###########################################################################
         # ------【核心逻辑】把 vllm_config 的各子配置拆解保存为快捷引用，方便后续按需访问 ------
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -240,6 +243,13 @@ class WorkerWrapperBase:
         envs = envs_list[self.rpc_rank]
         update_environment_variables(envs)
 
+
+
+
+
+
+
+
     @instrument(span_name="Worker init")
     def init_worker(self, all_kwargs: list[dict[str, Any]]) -> None:
         """
@@ -338,6 +348,23 @@ class WorkerWrapperBase:
         with set_current_vllm_config(self.vllm_config):
             # To make vLLM config available during worker initialization
             self.worker = worker_class(**kwargs) # 在这里构建的Worker子类的实例
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     def initialize_from_config(self, kv_cache_configs: list[Any]) -> None:
         # ------【TP】按 global_rank 取本 worker 对应的 KV cache 配置（张量并行各 rank 分片不同） ------

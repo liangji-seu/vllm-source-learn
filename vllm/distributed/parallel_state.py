@@ -1879,11 +1879,11 @@ def init_distributed_environment(
         else:
             _INNER_DP_WORLD = _WORLD
 
-
+# 开始切分并行组
 def initialize_model_parallel(
-    tensor_model_parallel_size: int = 1,
-    pipeline_model_parallel_size: int = 1,
-    prefill_context_model_parallel_size: int = 1,
+    tensor_model_parallel_size: int = 1, # tp
+    pipeline_model_parallel_size: int = 1, # pp
+    prefill_context_model_parallel_size: int = 1, # pcp
     decode_context_model_parallel_size: int | None = 1,
     backend: str | None = None,
 ) -> None:
@@ -1943,8 +1943,8 @@ def initialize_model_parallel(
         )
     else:
         # ------【核心逻辑】常规分支：从 torch.distributed 取 world_size/rank 与后端 ------
-        world_size = torch.distributed.get_world_size()
-        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size() # 用torch来获取我们当前的GPU的个数
+        rank = torch.distributed.get_rank() # gpu的rand列表吧
         backend = backend or torch.distributed.get_backend(
             get_world_group().device_group
         )
@@ -1958,9 +1958,33 @@ def initialize_model_parallel(
     # otherwise it will cause deadlock.
     # to get group_ranks for each dimension, transpose that dimension to the
     # last dimension, then reshape to 2D, then unbind the last dimension
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     # ------【TP/PP/DP】把 rank 重塑为 (ExternalDP,DP,PP,PCP,TP) 张量，便于按维转置切出各并行组 ------
-    all_ranks = torch.arange(world_size).reshape(
-        -1,
+    all_ranks = torch.arange(world_size).reshape( #  [0,1,2,..., world_size]
+        -1, 
         data_parallel_size,
         pipeline_model_parallel_size,
         prefill_context_model_parallel_size,

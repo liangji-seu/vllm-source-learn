@@ -261,6 +261,7 @@ class DefaultModelLoader(BaseModelLoader):
 
         return hf_folder, hf_weights_files, use_safetensors
 
+    # 获取权重的迭代器
     def _get_weights_iterator(
         self, source: "Source"
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -268,7 +269,7 @@ class DefaultModelLoader(BaseModelLoader):
         # ------【权重加载】准备权重文件列表与格式标志，据此选择迭代器类型 ------
         extra_config = self.load_config.model_loader_extra_config
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
-            source.model_or_path,
+            source.model_or_path, # 模型目录
             source.subfolder,
             source.revision,
             source.fall_back_to_pt,
@@ -285,6 +286,12 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_weights_files,
                 self.load_config.use_tqdm_on_load,
             )
+
+
+
+        ###############################################################
+        # 1. 我们以.safetensors格式来加载权重
+        ###############################################################
         # ------【权重加载】safetensors 家族按具体格式选择对应迭代器 ------
         elif use_safetensors:
             # ------【并行加载】fastsafetensors 使用 C++ 快速迭代器加速读取 ------
@@ -312,6 +319,9 @@ class DefaultModelLoader(BaseModelLoader):
                     )
                 # ------【权重加载+并行加载】单线程迭代器并透传 prefetch 线程/块大小做读盘预取 ------
                 else:
+                    ########################################################
+                    # 获得weights迭代器，每次获取一个（name, tensor）获取一个权重参数
+                    ########################################################
                     weights_iterator = safetensors_weights_iterator(
                         hf_weights_files,
                         self.load_config.use_tqdm_on_load,
@@ -347,10 +357,34 @@ class DefaultModelLoader(BaseModelLoader):
         # ------【核心逻辑】首次加载记录起始时间，用于统计整体加载耗时 ------
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()
+
+
+
+            
         # Apply the prefix.
         # ------【权重加载】为权重名统一加前缀后作为迭代器产出 ------
+        ###################################################################################
+        # 包装一个prefix在权重变量的名字上，然后返回
+        # 但有的模型有多个权重源（secondary_weights），
+        # 比如多模态模型的 audio/vision tower 放在另一个子文件夹里，那些 checkpoint 的权重名带一个命名空间前缀，不加就没法和模型内部的子模块参数对齐
+
+        # prefix 给"非主模型的权重"补上命名空间前缀，让多个权重源的名字不冲突、能对齐到正确的子模块。 主模型 prefix 是空串，等于不加
+        ####################################################################################
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 
+
+
+
+
+
+
+
+
+
+
+
+
+    # 生成器函数，抛出迭代器，流式读取权重
     def get_all_weights(
         self,
         model_config: ModelConfig,
@@ -358,13 +392,16 @@ class DefaultModelLoader(BaseModelLoader):
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         # ------【核心逻辑】构造主权重 Source（prefix 为空、回退策略取自模型属性） ------
         primary_weights = DefaultModelLoader.Source(
-            model_config.model,
-            model_config.revision,
+            model_config.model, # 模型的地址
+            model_config.revision, 
             prefix="",
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
         )
         # ------【权重加载】先产出主模型的全部权重 ------
+        ##################################################################
+        # 1. 抛出主权重的 迭代器
+        ##################################################################
         yield from self._get_weights_iterator(primary_weights)
 
         # ------【核心逻辑】读取模型可选的 secondary_weights 附加权重源 ------
@@ -457,6 +494,13 @@ class DefaultModelLoader(BaseModelLoader):
                 num_experts,
             )
 
+
+
+
+
+    ####################################################################################
+    # defaultmodelLoader子类负责加载模型权重，BaseModelLoader基类负责构造模型类实例
+    ####################################################################################
     @instrument(span_name="Load weights")
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         # ------【量化】torchao 序列化 checkpoint 需切换 safetensors 加载策略 ------
@@ -472,8 +516,43 @@ class DefaultModelLoader(BaseModelLoader):
         # ------【EP 权重切分】加载前先初始化本地专家 id 过滤集合 ------
         self._init_ep_weight_filter(model_config)
 
+
+
+
+        ###############################################################
+        # 1. 流式加载 迭代器的权重,   get_all_weights 抛出一个主权重的迭代器
+        ###############################################################
         # ------【权重加载】让模型以迭代器流式消费权重并完成参数初始化 ------
-        loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
+        # 在里面，模型的每一个组件的参数张量，被触发mmap的page fault, 被拷贝到了GPU的模型上
+        # 但是经过DDR，不能直接磁盘到GPU
+        # 磁盘 → OS page cache（DDR 宿主内存）→ PCIe → GPU 显存（HBM）
+        '''
+        vLLM 实际加载顺序是：先在 CPU 侧把权重灌进模型参数（mmap view → copy 到 CPU 参数），
+        之后 process_weights_after_loading 再把整个模型 .to(device) 搬到 GPU。所以权重数据在 DDR 里会停留一次，再整体上 GPU。
+
+        一句话：磁盘 → DDR（page cache/mmap）→ PCIe → GPU，必经 DDR
+        '''
+        loaded_weights = model.load_weights(self.get_all_weights(model_config, model)) 
+        '''
+        完整数据流
+
+            磁盘 → (mmap page fault) → DDR page cache → copy_ → 参数自己的 DDR 存储 → 之后 .to(device) → GPU
+            所以回答你的问题：权重数据先拷进 CPU/DDR 里的参数张量（meta 参数在这一刻变成 CPU 真实张量）。
+            GPU 是 load_weights 全部完成、process_weights_after_loading 之后，模型整体 .to(device) 才搬上去的。
+
+        关键点
+            meta 参数 + copy_(CPU 张量) → 物化成 CPU 张量，内存是在 DDR 里新分配的。
+            这一步是 DDR 内部拷贝（page cache → 参数存储），源数据的第一次真正"读磁盘"发生在 mmap 触发 page fault 时。
+            一句话：copy 到 CPU/DDR 里的参数存储；meta 是形状占位，copy 时才真正分配 DDR 内存装数据，GPU 是最后 .to(device) 的事。
+        '''
+
+        ############## 所以到这里，我们的权重全部加载进入的cpu
+
+
+
+
+
+
 
         # ------【核心逻辑】记录加载结束时间并打印整体加载耗时 ------
         self.counter_after_loading_weights = time.perf_counter()
@@ -495,6 +574,30 @@ class DefaultModelLoader(BaseModelLoader):
         # ------【权重加载】开启跟踪时校验模型参数是否全部来自 checkpoint ------
         if enable_weights_track:
             self.track_weights_loading(model, loaded_weights)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     def track_weights_loading(
         self, model: nn.Module, loaded_weights: set[str] | None

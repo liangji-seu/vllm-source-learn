@@ -60,7 +60,7 @@ class RMSNorm(CustomOp):
         )
         weight_dtype = dtype or torch.get_default_dtype()
         self.has_weight = has_weight
-        self.weight = torch.ones(hidden_size, dtype=weight_dtype)
+        self.weight = torch.ones(hidden_size, dtype=weight_dtype) # 这个就是nn.Parameter
         if self.has_weight:
             self.weight = nn.Parameter(self.weight)
 

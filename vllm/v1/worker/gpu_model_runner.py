@@ -480,6 +480,17 @@ class ExecuteModelState(NamedTuple):
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
 
+
+
+
+
+
+
+
+
+
+
+
 # 这个是modelrunner v1, 我们先看这个
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
@@ -492,7 +503,9 @@ class GPUModelRunner(
         vllm_config: VllmConfig,
         device: torch.device,
     ):
-        # ------【核心逻辑】把 vllm_config 的各个子配置拆成独立引用，便于后续就近访问 ------
+        ################################################
+        # 1. 配置与元信息
+        ################################################
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -517,6 +530,10 @@ class GPUModelRunner(
         self.check_ep_fault = False
         if parallel_config.data_parallel_size > 1 and self.model_config.is_moe:
             self.check_ep_fault = get_ep_all2all_manager().support_fault_tolerance
+
+
+
+
 
         # ------【内存池/CuMem】把 KV cache 的字符串 dtype 转成 torch dtype ------
         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
@@ -543,6 +560,14 @@ class GPUModelRunner(
         # Always set to false after the first forward pass
         self.dcp_world_size = self.parallel_config.decode_context_parallel_size
         self.dcp_rank = 0 if self.dcp_world_size <= 1 else get_dcp_group().rank_in_group
+
+
+
+
+
+
+
+
         # ------【核心逻辑】记录单步可调度的最大 token 数与请求数，作为缓冲上限 ------
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
         self.max_num_reqs = scheduler_config.max_num_seqs
@@ -589,7 +614,16 @@ class GPUModelRunner(
         # Async scheduling
         self.use_async_scheduling = self.scheduler_config.async_scheduling
 
-        # ------【核心逻辑】构建采样器，绑定 logprobs 模式与 gumbel 精度选项 ------
+
+
+
+
+
+
+
+        ################################################
+        # 2. 构造采样器
+        ################################################
         # Sampler
         self.sampler = Sampler(
             logprobs_mode=self.model_config.logprobs_mode,
@@ -607,11 +641,19 @@ class GPUModelRunner(
         Will be lazily initialized when the model is loaded.
         """
 
+
+
+
+
+
+        ################################################
+        # 3. KV cache tensor 列表声明
+        ################################################
         # ------【内存池/CuMem】KV cache 张量与注意力分组等先占位，待 initialize_kv_cache 再填 ------
         # Lazy initializations
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
-        self.kv_caches: list[torch.Tensor] = []
+        self.kv_caches: list[torch.Tensor] = [] # 每层的kvcache张量
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -741,13 +783,26 @@ class GPUModelRunner(
             self.use_async_scheduling and self.num_spec_tokens > 0
         )
 
-        # ------【核心逻辑】请求状态缓存字典，按 req_id 保存每个请求的持久状态 ------
+
+
+
+
+
+        ################################################
+        # 4. 请求状态 
+        ################################################
+
+        # 每个req的持久状态缓存
         # Request states.
-        self.requests: dict[str, CachedRequestState] = {}
+        self.requests: dict[str, CachedRequestState] = {} # 持久化批处理
+
+
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
 
+
+        
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
         # `initialize_kv_cache` based on the kv cache config. However, as in
@@ -758,7 +813,7 @@ class GPUModelRunner(
         # in `initialize_kv_cache` if the block_sizes here is different from
         # the block_sizes in the kv cache config.
         # ------【核心逻辑】构建自定义 logits 处理器序列，供 InputBatch 采样阶段调用 ------
-        logits_processors = model_config.logits_processors
+        logits_processors = model_config.logits_processors # 原始打分处理器
         custom_logitsprocs: Sequence[str | type[LogitsProcessor]] = (
             tuple(logits_processors) if logits_processors is not None else ()
         )
@@ -773,20 +828,27 @@ class GPUModelRunner(
         self._init_kernel_block_sizes = [placeholder_block_size]
         self._init_max_num_blocks = [placeholder_max_num_blocks]
         self._init_slot_mapping_modes = [SlotMappingMode.TOKEN_TO_KV_SLOT]
-        # ------【核心逻辑】构建输入 batch 管理器，绑定 vocab/块大小/投机数等元信息 ------
+
+
+
+        ################################################
+        # 5. InputBatch 转换器 
+        ################################################
+
+        # batch 级输入管理，绑定了 vocab 大小、block 大小、logitsprocs 等元信息。step 时把 scheduler 给的一批 req 组装进这里
         self.input_batch = InputBatch(
-            max_num_reqs=self.max_num_reqs,
+            max_num_reqs=self.max_num_reqs, # batch的最大req数
             # We need to use the encoder length for encoder-decoder
             # because of KV cache for cross-attention.
-            max_model_len=max(self.max_model_len, self.max_encoder_len),
-            max_num_batched_tokens=self.max_num_tokens,
+            max_model_len=max(self.max_model_len, self.max_encoder_len), # 每个req的最大kv长度
+            max_num_batched_tokens=self.max_num_tokens, # 这个batch的最大tokens数量
             device=self.device,
-            vocab_size=self.model_config.get_vocab_size(),
+            vocab_size=self.model_config.get_vocab_size(), # 词袋大小
             block_sizes=[placeholder_block_size],
             kernel_block_sizes=[placeholder_block_size],
             max_num_blocks_per_req=[placeholder_max_num_blocks],
-            num_spec_tokens=self.num_spec_tokens,
-            logitsprocs=build_logitsprocs(
+            num_spec_tokens=self.num_spec_tokens, # 投机解码的草稿token数量
+            logitsprocs=build_logitsprocs( # 构建的打分处理器，在采样前，修改这个分数，施加约束
                 self.vllm_config,
                 self.device,
                 PIN_MEMORY,
@@ -839,25 +901,106 @@ class GPUModelRunner(
 
         # ------【CUDA Graph+内存池/CuMem】预分配 CUDA graph 回放所需的持久缓冲，避免每步重复分配 ------
         # Persistent buffers for CUDA graphs.
-        # ------【CUDA Graph】输入 token、位置、query 起始位置、序列长度等核心输入缓冲 ------
-        self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
+
+
+
+
+        #################
+        # 这边其实就是构造本次batch的快照的输入缓冲区，只不过利用了一个CPU-GPU的双份+numpy视图，cpu侧的buffer负责写入，GPU侧的显存区域负责读取。
+        # 这些字段，每个都是单独的一块，大小 = 最大容量， 合起来分角度描述当前的batch
+        # 这些buffer的内容不累计，每个step来新batch, 就把活跃的前n个位置复写成新值，GPU来读这一step的输入快照
+
+        # 真正的持续状态是requests: 每个req的元信息，跨step累计
+
+        # 这些 _make_buffer 的 buffer 只是每次的输入暂存区，固定分配是为了两点：
+
+            # CUDA graph 回放要固定地址；
+            # 避免每步 malloc/free。
+
+        #####################
+        # input_ids, positions, query_start_loc, seq_lens, num_computed_tokens/ req_indices 
+        # 这些是 CUDA graph 回放时要复用的固定张量,提前按 max_num_tokens/max_num_reqs 一次性分配，避免每步重复 malloc
+        '''
+                场景
+        请求	        类型	                                本轮 query token
+        req0	        prefill，prompt="你好介绍一下vLLM"	        9 个 token（整个 prompt）
+        req1	        decode，已生成 30 个 token	                1 个新 token
+        req2	        decode，已生成 15 个 token	                1 个新 token
+        req3	        prefill，prompt="什么是attention"	        7 个 token
+        
+        本轮 query token 总数 = 9 + 1 + 1 + 7 = 18。
+
+----------------------------------------------------------------------------------------------------
+        query_start_loc = [0, 9, 10, 11, 18]   # 长度 5 = 4 请求 + 1
+
+        input_ids  (扁平一维，长度 18):
+        [你,好,介,绍,一,下,v,L,L,M | 新token | 新token | 什,么,是,a,t,t,e]
+        └──── req0 (0~8)    ────┘  req1(9)  req2(10)  └── req3 (11~17) ──┘
+
+        positions  (每个 token 在自己序列里的绝对位置):
+        [0,1,2,3,4,5,6,7,8              | 30 |  15      | 0,1,2,3,4,5,6]
+        └── req0: prompt 从 0 排到 8 ──┘ ↑req1   ↑req2  └─ req3: prompt 从 0 排 ─┘
+
+        seq_lens = [9, 31, 16, 7]
+                ↑req0(9)  ↑req1(30+1=31)  ↑req2(15+1=16)  ↑req3(7)
+
+
+----------------------------------------------------------------------------------------------------                       
+        三个数组怎么对上
+        query_start_loc 告诉你每个请求的 query 在扁平数组里从哪到哪：
+
+            req0 → input_ids[0:9]
+            req1 → input_ids[9:10]
+            req2 → input_ids[10:11]
+            req3 → input_ids[11:18]
+        positions 和 input_ids 一一对应（同一扁平索引），但值不同：
+
+        prefill 的 req0/req3：从 0 递增（因为是 prompt，位置从头排）
+        decode 的 req1/req2：只有一个值 30/15（这是该 token 在它自己整条序列里的绝对位置，不是扁平数组下标）
+        seq_lens 是每个请求完整序列长度（KV 侧要读多少），和 query 数无关：
+
+        req1 的 seq_lens=31，但本轮 query 只有 1 个（query_start_loc 区间长度 1）。
+
+----------------------------------------------------------------------------------------------------
+        query_start_loc:  扁平数组下标 → 每个请求的 query 起止（Q 侧，本轮要算几个 token）
+        positions:        每个 query token 在各自序列里的绝对位置（喂给 RoPE 位置编码）
+        seq_lens:         每个请求完整长度（KV 侧，attention 要读多少历史）
+        input_ids         扁平化的所有req的token ids
+
+        '''
+
+        ################################################################################################
+        # 5. 每轮batch输入的整理统计信息 的 缓冲区申请
+        ################################################################################################
+        self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32) 
         self.positions = torch.zeros(
-            self.max_num_tokens, dtype=torch.int64, device=self.device
+            self.max_num_tokens, dtype=torch.int64, device=self.device # gpu侧的张量：长度是本轮调度的token最大个数
         )
-        self.query_start_loc = self._make_buffer(
+        '''
+        query就是一个req本轮要计算的token部分，prefill就是prompt, decode就是1token
+
+        不同的请求，query长度不同，无法用规整的[batch, seq_len]二维矩阵装，
+        vllm的做法是把所有req的query token 压成一条一维数组，然后用query_start_loc记录每个请求的起点。
+        '''
+        self.query_start_loc = self._make_buffer( # cpu侧的buffer, 
             self.max_num_reqs + 1, dtype=torch.int32
         )
         self.seq_lens = torch.zeros(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
+
         # ------【异步 RPC】pinned CPU 上界缓冲，供 CPU 侧免同步读取 seq_lens ------
         self.optimistic_seq_lens_cpu = torch.zeros(
             self.max_num_reqs, dtype=torch.int32, pin_memory=PIN_MEMORY
         )
+
+
         # ------【核心逻辑】已计算 token 数、草稿 token 数、请求索引与位置映射等状态缓冲 ------
+        # 每个req已经被计算的tokens数
         self.num_computed_tokens = torch.zeros(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
+        # 每个req的草稿token数
         self.prev_num_draft_tokens = self._make_buffer(
             self.max_num_reqs, dtype=torch.int32
         )
@@ -1050,6 +1193,21 @@ class GPUModelRunner(
                 self.max_num_reqs, dtype=torch.int32
             )
         self.layerwise_nvtx_hooks_registered = False
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     def update_max_model_len(self, max_model_len: int) -> None:
         # ------【核心逻辑】更新主模型最大长度 ------
@@ -1314,6 +1472,11 @@ class GPUModelRunner(
         # ------【前缀缓存】按调度器释放列表逐条删除 encoder 缓存，回收显存 ------
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
             self.encoder_cache.pop(mm_hash, None)
+
+
+
+
+
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
         """Update the cached states and the persistent batch with the scheduler
@@ -4980,6 +5143,29 @@ class GPUModelRunner(
 
         return None
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     def _input_fits_in_drafter(
         self, common_attn_metadata: CommonAttentionMetadata | None
     ) -> bool:
@@ -5858,10 +6044,18 @@ class GPUModelRunner(
                 time_before_load = time.perf_counter()
                 if load_dummy_weights:
                     self.load_config.load_format = "dummy"
+
+                ##########################################################################################################
+                #  1. 获取模型加载器， 加载模型：构造模型实例 + 拷贝权重
+                ##########################################################################################################
                 model_loader = get_model_loader(self.load_config) # modelrunner里面构造一个model_loader 模型加载器
-                self.model = model_loader.load_model( # 加载模型
+                self.model = model_loader.load_model( # 加载模型 = 构造模型实例 + 拷贝权重
                     vllm_config=self.vllm_config, model_config=self.model_config
                 )
+
+
+
+
                 # ------【LoRA】加载 LoRA 低秩适配器并合并到主模型 ------
                 if self.lora_config:
                     self.model = self.load_lora_model( # 加载lora微调模型
@@ -5936,7 +6130,9 @@ class GPUModelRunner(
 
                 # ------【显存 profiling】记录加载结束时间与模型实际显存占用 ------
                 time_after_load = time.perf_counter()
-            self.model_memory_usage = m.consumed_memory
+
+
+            self.model_memory_usage = m.consumed_memory # 模型权重占用显存
         # ------【显存 profiling】显存不足时给出降低显存占用的友好提示并重新抛出 ------
         except torch.cuda.OutOfMemoryError as e:
             msg = (
@@ -6032,6 +6228,12 @@ class GPUModelRunner(
 
         # ------【显存 profiling】初始化卸载器，管理受限显存下的权重/KV 卸载 ------
         get_offloader().post_init()
+
+
+
+
+
+
 
 
 
@@ -6442,16 +6644,22 @@ class GPUModelRunner(
             )
         )
 
+
+
+
+    ########################################################
+    # 实际按照配置，跑一次profile 的 dummy run
+    ########################################################
     @torch.inference_mode()
     def _dummy_run(
         self,
-        num_tokens: int,
+        num_tokens: int, # batch的最大token预算
         cudagraph_runtime_mode: CUDAGraphMode | None = None,
-        force_attention: bool = False,
+        force_attention: bool = False, 
         uniform_decode: bool = False,
         allow_microbatching: bool = True,
         skip_eplb: bool = False,
-        is_profile: bool = False,
+        is_profile: bool = False, # 设置为profile run
         create_mixed_batch: bool = False,
         remove_lora: bool = True,
         is_graph_capturing: bool = False,
@@ -6512,12 +6720,25 @@ class GPUModelRunner(
         # routine of FA2 for pure decode, i.e., Flashdecode + an optimization
         # for GQA/MQA.
         # ------【CUDA Graph】统一 decode 批次用固定 query_len，否则用 num_tokens ------
+
+        #########################################################一个req的最长可以到整个预算
         max_query_len = self.uniform_decode_query_len if uniform_decode else num_tokens
 
         # ------【核心逻辑】构造 dummy 批次的每请求 token 分配，满足总数==num_tokens ------
         # Set num_scheduled_tokens based on num_tokens and max_num_seqs
         # for dummy run with LoRA so that the num_reqs collectively
         # has num_tokens in total.
+
+
+
+
+
+
+
+
+
+
+        # 判断dummy batch的每个req的token分配
         assert num_tokens <= self.max_num_tokens
         max_num_reqs = self.scheduler_config.max_num_seqs
         # ------【CUDA Graph】混合 prefill-decode 批次：前段 decode 请求 + 一个 prefill 请求 ------
@@ -6542,26 +6763,44 @@ class GPUModelRunner(
                 num_scheduled_tokens_list[-1] = num_tokens % max_query_len
         # ------【核心逻辑】通用批次：token 尽可能均匀分到各请求 ------
         else:
-            num_reqs = min(num_tokens, max_num_reqs)
-            min_tokens_per_req = num_tokens // num_reqs
-            num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
-            num_scheduled_tokens_list[-1] += num_tokens % num_reqs
+            # 这里才是我们的逻辑
+            ########################################################
+            # 指定dummy batch的参数
+            ########################################################
+            num_reqs = min(num_tokens, max_num_reqs) # batch的req数
+            min_tokens_per_req = num_tokens // num_reqs # 每个req的平均token预算
+            num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs # 构造一个每个req的token数的list
+            num_scheduled_tokens_list[-1] += num_tokens % num_reqs # 余数塞给最后一个req
 
         assert sum(num_scheduled_tokens_list) == num_tokens
         assert len(num_scheduled_tokens_list) == num_reqs
-        # ------【核心逻辑】转成 numpy 数组并记录未 padding 的真实 token 数 ------
-        num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
-        num_tokens_unpadded = int(num_scheduled_tokens.sum())
 
-        num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
+
+
+
+
+
+
+
+
+
+
+
+
+
+        # ------【核心逻辑】转成 numpy 数组并记录未 padding 的真实 token 数 ------
+        num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32) # 每个req分几个token
+        num_tokens_unpadded = int(num_scheduled_tokens.sum()) # 真实总数（每个req未padding）
+
+        num_sampled_tokens = np.ones(num_reqs, dtype=np.int32) # 每个req decode 1个的list
 
         # ------【CUDA Graph】确定批次执行方式（是否 ubatch/DP 切分/是否 padding） ------
         _cudagraph_mode, batch_desc, should_ubatch, num_tokens_across_dp, _ = (
             self._determine_batch_execution_and_padding(
-                num_tokens=num_tokens_unpadded,
-                num_reqs=num_reqs,
-                num_scheduled_tokens_np=num_scheduled_tokens,
-                max_num_scheduled_tokens=max_query_len,
+                num_tokens=num_tokens_unpadded, # 未padding的这个batch的总token数
+                num_reqs=num_reqs, # batch的请求数
+                num_scheduled_tokens_np=num_scheduled_tokens, # 每个req分几个token作为prompt的numpy数组
+                max_num_scheduled_tokens=max_query_len, # 最大被调度的token数
                 use_cascade_attn=False,
                 allow_microbatching=allow_microbatching,
                 force_eager=is_profile
@@ -6620,6 +6859,11 @@ class GPUModelRunner(
         attn_metadata: PerLayerAttnMetadata | None = None
 
         # ------【核心逻辑】为 dummy 批次生成 slot 映射，用于 KV cache 写入地址 ------
+        ########################################################
+        # 创建kvcache槽位，
+        # vllm的策略是通过把模型权重算上，然后让激活值达到peak， 
+        # 这样就可以计算出我们的kvcache的最大可用容量，所以dummy batch并不需要占满所有的kvcache， 只要把batch的最大token数，req数打满，让激活值最大就行了
+        ########################################################
         slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
             num_tokens_padded=num_tokens_padded,
             num_reqs_padded=num_reqs_padded,
@@ -6780,6 +7024,9 @@ class GPUModelRunner(
                     num_tokens_across_dp[:] = num_tokens_padded
 
             # ------【CUDA Graph】在随机化输入与 forward 上下文中执行一次模型前向 ------
+
+
+
             with (
                 self.maybe_randomize_inputs(input_ids, inputs_embeds),
                 set_forward_context(
@@ -6793,6 +7040,9 @@ class GPUModelRunner(
                     slot_mapping=slot_mappings,
                 ),
             ):
+                ########################################################
+                # 这边开始前向推理 dummy batch
+                ########################################################
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -6881,7 +7131,40 @@ class GPUModelRunner(
         logit_indices_device = torch.from_numpy(logit_indices).to(
             self.device, non_blocking=True
         )
+
+
+        ########################################################
+        # 返回结果
+        ########################################################
         return hidden_states, hidden_states[logit_indices_device]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     @torch.inference_mode()
     def _dummy_sampler_run(
@@ -7085,9 +7368,24 @@ class GPUModelRunner(
         max_task = max(output_size.items(), key=lambda x: x[1])[0]
         return self._dummy_pooler_run_task(hidden_states, max_task)
 
+
+
+
+
+
+
+
+
+
+
+
+    ########################################################
+    # 来执行一次dummy的profile run
+    ########################################################
     def profile_run(self) -> None:
         # ------【显存 profiling】先用多模态编码器跑 dummy，估算 encoder 与缓存显存 ------
         # Profile with multimodal encoder & encoder cache.
+        # 多模态相关，跳过
         if self.supports_mm_inputs:
             mm_config = self.model_config.multimodal_config
             if mm_config is not None and mm_config.skip_mm_profiling:
@@ -7148,9 +7446,14 @@ class GPUModelRunner(
 
         # ------【显存 profiling】用最大 token 数做 dummy 前向，预分配通信缓冲并触发显存分配 ------
         # Add `is_profile` here to pre-allocate communication buffers
+        ########################################################
+        # 实际跑一次
+        ########################################################
         hidden_states, last_hidden_states = self._dummy_run(
-            self.max_num_tokens, is_profile=True
+            self.max_num_tokens, is_profile=True 
         )
+
+
         if get_pp_group().is_last_rank:
             if self.is_pooling_model:
                 output = self._dummy_pooler_run(hidden_states)
@@ -7163,6 +7466,36 @@ class GPUModelRunner(
         del hidden_states, output
         self.encoder_cache.clear()
         gc.collect()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     def _init_minimal_kv_cache_for_profiling(self) -> None:
         from vllm.v1.core.kv_cache_utils import (
@@ -8018,6 +8351,9 @@ class GPUModelRunner(
             f"!= kv_cache kernel_block_sizes {kernel_block_sizes}"
         )
 
+    ############################################################################################
+    # 创建各个layer的kv cache tensor
+    ############################################################################################
     def _allocate_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig
     ) -> dict[str, torch.Tensor]:
@@ -8034,6 +8370,11 @@ class GPUModelRunner(
         # ------【内存池/CuMem】按配置分配 KV cache 底层字节缓冲，packed 张量共享同一 backing ------
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
         packed_backing: torch.Tensor | None = None
+
+
+        ############################################################################################
+        # 配置里面的每个张量
+        ############################################################################################
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             if kv_cache_tensor.block_stride > 0:
                 # Allocate once; all packed tensors alias the same backing.
@@ -8045,9 +8386,16 @@ class GPUModelRunner(
                     )
                 tensor = packed_backing
             else:
+                ############################################################################################
+                # 创建GPU上的张量
+                ############################################################################################
                 tensor = torch.zeros(
                     kv_cache_tensor.size, dtype=torch.int8, device=self.device
                 )
+
+                ############################################################################################
+                # 标记共享tensor形状的layer有哪些
+                ############################################################################################
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor
 
@@ -8063,6 +8411,15 @@ class GPUModelRunner(
         )
         return kv_cache_raw_tensors
 
+
+
+
+
+
+
+
+
+
     def _attn_group_iterator(self) -> Iterator[AttentionGroup]:
         return itertools.chain.from_iterable(self.attn_groups)
 
@@ -8072,6 +8429,10 @@ class GPUModelRunner(
         for attn_groups in self.attn_groups:
             yield from attn_groups
 
+
+    ############################################################################################
+    # 单layer的tensor，reshape出block维度
+    ############################################################################################
     def _reshape_kv_cache_tensors(
         self,
         kv_cache_raw_tensors: dict[str, torch.Tensor],
@@ -8192,6 +8553,26 @@ class GPUModelRunner(
 
         return kv_caches
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     def _has_mixed_attention_kv_layout(self, kernel_block_sizes: list[int]) -> bool:
         """Whether attention groups disagree on the physical KV cache layout.
 
@@ -8254,6 +8635,13 @@ class GPUModelRunner(
                     stride=(hidden_size, 2 * hidden_size, *kv_cache.stride()[2:]),
                 )
 
+
+
+
+
+    ############################################################################################
+    # 实际划分每个group的各个layer的kvcache tensor， 也就是我们的初始化
+    ############################################################################################
     def initialize_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
     ) -> dict[str, torch.Tensor]:
@@ -8288,9 +8676,15 @@ class GPUModelRunner(
             # ------【核心逻辑】回退通用路径：先分配原始缓冲再 reshape 成层形状 ------
             # Fallback to the general case
             # Initialize the memory buffer for KV cache
+            ############################################################################################
+            # 最通用的分配显存的方法
+            ############################################################################################
             kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
 
             # Change the memory buffer to the desired shape
+            ############################################################################################
+            # 对这些个kv cache tensor， reshape出各自的block的维度，然后添加到kv_caches，这个就是我们的block显存池
+            ############################################################################################
             kv_caches = self._reshape_kv_cache_tensors(
                 kv_cache_raw_tensors, kernel_block_sizes
             )
@@ -8312,6 +8706,20 @@ class GPUModelRunner(
             num_attn_module,
         )
         return kv_caches
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(
         self, kv_cache_config: KVCacheConfig
@@ -8344,9 +8752,18 @@ class GPUModelRunner(
                 else:
                     break
 
+
+
+
+
+
+
+
+
+
     def initialize_kv_cache(
         self,
-        kv_cache_config: KVCacheConfig,
+        kv_cache_config: KVCacheConfig, # 这个就是已经分配好显存方案的配置文件，各个group的张量布局
         is_profiling: bool = False,
     ) -> None:
         """
@@ -8384,7 +8801,17 @@ class GPUModelRunner(
 
         # Reinitialize need to after initialize_attn_backend
         self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
+
+
+
+
+
+
+
         # ------【内存池/CuMem】分配并 reshape 出最终 KV cache 张量 ------
+        ############################################################################################
+        # 划分不同group的各layer的kvcache tensor区域
+        ############################################################################################
         kv_caches = self.initialize_kv_cache_tensors(
             kv_cache_config, kernel_block_sizes
         )
@@ -8409,6 +8836,22 @@ class GPUModelRunner(
             else:
                 kv_transfer_group.register_kv_caches(kv_caches)
             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     def get_routed_experts(
         self,

@@ -1037,7 +1037,7 @@ def _try_load_model_cls(
 ) -> type[nn.Module] | None:
     from vllm.platforms import current_platform
 
-    current_platform.verify_model_arch(model_arch)
+    current_platform.verify_model_arch(model_arch) # 命中就返回
     try:
         return model.load_model_cls()
     except Exception:
@@ -1339,8 +1339,9 @@ class _ModelRegistry:
                 if model_cls is not None:
                     return (model_cls, arch)
 
-        for arch in architectures:
-            normalized_arch = self._normalize_arch(arch, model_config)
+        # 普通模型走的加载模型类的地方，根据我们的architecture来找到vllm自己的模型类
+        for arch in architectures: # 遍历架构名列表
+            normalized_arch = self._normalize_arch(arch, model_config) # 规范化
             model_cls = self._try_load_model_cls(normalized_arch)
             if model_cls is not None:
                 return (model_cls, arch)
@@ -1357,6 +1358,13 @@ class _ModelRegistry:
                     return (model_cls, arch)
 
         return self._raise_for_unsupported(architectures)
+
+
+
+
+
+
+
 
     def is_text_generation_model(
         self,

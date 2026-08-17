@@ -130,14 +130,20 @@ class KVCacheSpecKind(str, Enum):
 @dataclass(frozen=True)
 class KVCacheSpec:
     """
+    一个基础类，描述一个层的，kvcache的形状
     A base class for specifying the KV cache format of one layer.
     """
 
     # ------【显存 profiling】block_size：一个 block 可容纳的 token 数（页内 token 数） ------
     # number of tokens in a block
-    block_size: int
+    block_size: int # 一个block内的token数， 16个
 
     # ------【显存 profiling】page_size_bytes：单页字节数，抽象方法由子类按布局实现 ------
+
+
+
+
+
     @property
     def page_size_bytes(self) -> int:
         """
@@ -1081,36 +1087,105 @@ def get_kv_cache_spec_sliding_window(kv_cache_spec: KVCacheSpec) -> int | None:
 
 
 # ------【显存 profiling/TP】KVCacheTensor：Engine→Worker 的 KV cache 张量初始化规格 DTO，经 executor 下发，描述每层张量布局 ------
+
 @dataclass
 class KVCacheTensor:
+    '''
+    首先，我们要明确，Transformer的每一层layeri, 他们的kvcache的形状是： token_num * dim(k) * 2, 所以worker需要事先确定好这个形状，然后才能划分block，申请整块显存
+    所以一个block占用的显存：block_size * dim_k * 2
+
+    但是如果某些架构的模型，他有不同的kvcache形状，表现为dim_k不同，这样其实每个block就会发生变化了 = block_size * dim_k' * 2 这就是两个不同形状的张量。
+
+    比如layer0-9 是 KV 的dim = 1024, layder10-31的KV是dim = 2048, 所以这两个组的每个token的kv张量的形状就不一样，这两个组占用的KVcache显存区间大小也不一样
+
+    因此，我们用一个KVCacheTensor来描述一种形状的KV张量的整个显存空间，也就是张量。
+
+    至于每种类型的KV张量申请的token数量，是worker在profiling的时候测出来的。
+
+
+    KVCacheTensor描述一类具有相同物理布局的KV cache显存区域，包括大小、offset、stride等信息。
+    '''
+    # 告诉worker：你该创建什么样子的KVCache
     """
     A class for specifying how the workers should initialize the KV cache.
     """
 
-    # ------【显存 profiling】size：该 KV cache 张量字节数 ------
+    # 这种kv张量类型的 所有层 的kvcache的显存  总共占多少字节： 
     size: int  # size of the KV cache tensor in bytes
-    # ------【显存 profiling】shared_by：共享同一张量的层名列表（跨层复用显存） ------
+
+    # 这种kv张量类型的层有哪些
     shared_by: list[str]  # layer names that share the same KV cache tensor
+
+
+
     # ------【显存 profiling/对齐】offset：该层在连续块中的字节偏移 ------
+    # vllm里面把多个layer的张量放大一块大的张量上，所以，这个offset就是字节偏移
+    '''
+    一个大 tensor:
+        +----------------+
+        | layer0 KV      |
+        +----------------+
+        | layer1 KV      |
+        +----------------+
+        | layer2 KV      |
+        +----------------+
+    '''
+    # 每个层 所属的kvcache的显存空间，在这一组的张量区间的 字节偏移量
     offset: int = 0  # byte offset of this layer within a contiguous block
+
+
+
+
     # ------【显存 profiling/打包布局】block_stride：打包布局下每块总字节数（0=非打包） ------
+    # paged KV cache 相关，
+    '''
+    我们一个req {block 34, block 46, }是这样的，我们显存总共能有num_gpu_blocks个block，不可能一个个malloc
+    vllm里面是通过直接malloc一整个大的block来的
+    KVCacheTensor:
+
+        +--------------------------------+
+        | block0                         |
+        +--------------------------------+
+        | block1                         |
+        +--------------------------------+
+        | block2                         |
+        +--------------------------------+
+        | ...                            |
+        +--------------------------------+
+        | block999                       |
+        +--------------------------------+
+        这里面，每个block在这个大的KVCacheTensor中占固定大小
+
+        vLLM 根据 attention 层的 KV cache shape 计算一个 block（固定 block_size 个 token）的物理大小，
+        然后把大量这样的 block 连续排列成 KV cache tensor。
+        
+        block_table 保存逻辑 block 到物理 block id 的映射，block_stride 用于根据 block id 计算实际显存地址
+    '''
     block_stride: int = 0  # total bytes per block in a packed layout (0 = not packed)
 
 
-# ------【核心逻辑/显存 profiling】KVCacheGroupSpec：Engine→KV cache manager 的层分组 DTO，同组层共享同一块表 ------
+# 逻辑管理层面：告诉 KVCacheManager 哪些 layer 应该作为一组来管理，它们共享同一个 block table。
 @dataclass
 class KVCacheGroupSpec:
+    '''
+    相同kvcache形状的一组层的kvcache，可以整组管理
+    '''
     """
     Represents a group of model layers that share the same KV cache block table.
     These layers are regarded as one layer in the KV cache manager.
     """
 
-    # ------【核心逻辑】layer_names：组内层名列表 ------
+    # 在这个dim=1024的kvcache形状组 里面的 layer的层名
     # The names of model layers in this group
     layer_names: list[str]
-    # ------【显存 profiling】kv_cache_spec：该组对应的 KV cache spec ------
+
+    #这个kvcache的具体形状
     # The KV cache spec of this manager layer
-    kv_cache_spec: KVCacheSpec
+    kv_cache_spec: KVCacheSpec 
+
+
+
+    
     # ------【投机解码】is_eagle_group：是否为 EAGLE/MTP 草稿注意力层组 ------
     # Whether this group contains EAGLE/MTP draft attention layers.
     is_eagle_group: bool = False
@@ -1126,7 +1201,8 @@ class KVCacheConfig:
     # ------【显存 profiling】num_blocks：KV cache 块总数（池容量） ------
     num_blocks: int
     """The number of KV cache blocks"""
-    # ------【显存 profiling】kv_cache_tensors：每层 KV cache 张量初始化规格列表 ------
+    
+    # 每种张量类型的kvcache的显存张量的列表
     kv_cache_tensors: list[KVCacheTensor]
     """How should model runner initialize the KV cache tensors for each layer"""
     # ------【核心逻辑】kv_cache_groups：KV cache 分组列表（同构层合并为一组） ------

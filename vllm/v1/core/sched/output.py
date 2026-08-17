@@ -44,7 +44,7 @@ class NewRequestData:
     sampling_params: SamplingParams | None
     # ------【核心逻辑】pooling_params：pooling/embedding 类模型的汇聚参数，与 sampling 互斥使用 ------
     pooling_params: PoolingParams | None
-    # ------【内存池/CuMem】block_ids：该请求占用的 KV cache block id（每层一个 list），指向显存池中的块 ------
+    # ------【内存池/CuMem】block_ids：该请求占用的 KV cache block id（每group一个 list），指向显存池中的块 ------
     block_ids: tuple[list[int], ...]
     # ------【前缀缓存】num_computed_tokens：已计算过的 token 数，作为前缀复用起点跳过重复计算 ------
     num_computed_tokens: int
@@ -274,16 +274,16 @@ class SchedulerOutput:
     # Whether any of the scheduled requests use structured output.
     # Set only in async scheduling case.
     # ------【结构化输出/grammar】has_structured_output_requests：本轮是否含结构化输出请求，决定是否走 grammar 约束解码 ------
-    has_structured_output_requests: bool = False
+    has_structured_output_requests: bool = False # 本轮是否含结构化输出req
 
     # Whether the scheduled requests have all the output tokens they
     # need to perform grammar bitmask computation.
     # ------【结构化输出/grammar】pending_structured_output_tokens：请求是否已有全部输出 token 以进行 grammar bitmask 计算 ------
-    pending_structured_output_tokens: bool = False
+    pending_structured_output_tokens: bool = False # 被调度的请求是否有全部的输出token来被检查语法
 
     # Used for adjusting acceptance rate calculation.
     # ------【投机解码】num_invalid_spec_tokens：req_id→被拒草稿 token 数，用于校准投机接受率统计 ------
-    num_invalid_spec_tokens: dict[str, int] | None = None
+    num_invalid_spec_tokens: dict[str, int] | None = None # 被拒绝的草稿token的表
 
     # KV Cache Connector metadata.
     # ------【PD 分离/异步 RPC】kv_connector_metadata：外部 KV 传输 connector 元数据，用于 disaggregation 场景跨实例搬运 KV cache ------
@@ -299,11 +299,11 @@ class SchedulerOutput:
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
     # ------【内存池/CuMem】new_block_ids_to_zero：本轮新分配的 block id，worker 使用前先清零显存，防陈旧 NaN/脏数据污染 attention/SSM ------
-    new_block_ids_to_zero: list[int] | None = None
+    new_block_ids_to_zero: list[int] | None = None # 本轮新分配需要清零的block
 
     # CoW copies to apply after zeroing new blocks and before forward.
     # ------【前缀缓存】kv_cache_block_copies：清零后、forward 前执行的 KV cache CoW 拷贝，用于前缀复用/块迁移 ------
-    kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
+    kv_cache_block_copies: list[KVCacheBlockCopy] | None = None 
 
     # Producer partial-tail offload hand-off for external KV connectors:
     # {request_id: [(group_id, block_id, boundary_tokens), ...]} pointing at
