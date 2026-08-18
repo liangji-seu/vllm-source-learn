@@ -792,9 +792,15 @@ class GPUModelRunner(
         # 4. 请求状态 
         ################################################
 
+        '''
+        每个model_runner实例对象，维护的内部属性：
+
+        self.requests : dict[req_name, CachedRequestState]
+        
+        '''
         # 每个req的持久状态缓存
         # Request states.
-        self.requests: dict[str, CachedRequestState] = {} # 持久化批处理
+        self.requests: dict[str, CachedRequestState] = {} ####################### 持久化批处理
 
 
         # NOTE(rob): num_prompt_logprobs only includes reqs
@@ -4747,12 +4753,20 @@ class GPUModelRunner(
         # ------【chunked prefill】检查所有请求是否都被标记为丢弃采样结果（全是中间 prefill chunk） ------
         return bool(self.discard_request_mask.np[:num_reqs].all())
 
+
+
+
+########################
+# model_runner 开始执行一次 batch调度任务
+########################
     @torch.inference_mode()
     def execute_model(
         self,
-        scheduler_output: "SchedulerOutput",
+        scheduler_output: "SchedulerOutput", # 调度任务batch， 增量信息
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+
+        
         # ------【核心逻辑】校验上一步状态已清理，execute_model 与 sample_tokens 必须交替调用 ------
         if self.execute_model_state is not None:
             raise RuntimeError(
@@ -4790,9 +4804,30 @@ class GPUModelRunner(
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
+
+
+
+
+
+
+
+
+
+
+            
             # Update persistent batch states.
             # ------【核心逻辑】更新持久 batch 状态，返回延迟状态修正闭包供后续调用 ------
+            ########################################################################
+            # 1. 更新inputBatch持久化信息
+            ########################################################################
             deferred_state_corrections_fn = self._update_states(scheduler_output)
+
+
+
+
+
+
+
 
             # ------【PD 分离+多模态】EC 生产者只跑编码器并返回空输出，解码交给消费者 ------
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
@@ -4831,6 +4866,17 @@ class GPUModelRunner(
                     "it when the requests need prompt logprobs"
                 )
 
+
+
+
+
+
+
+
+
+            ########################################################################
+            # 开始从inputbatch里面提取本次要执行的缓冲区信息
+            ########################################################################
             num_reqs = self.input_batch.num_reqs
             req_ids = self.input_batch.req_ids
             # ------【核心逻辑】汇总每条请求本步调度的 token 数，得到 CPU 侧逐请求数组 ------
@@ -4844,6 +4890,11 @@ class GPUModelRunner(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
+
+
+
+
+
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
@@ -4966,7 +5017,14 @@ class GPUModelRunner(
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
-            # ------【核心逻辑】构建两层 slot mapping：按 KV 组与按层名，供 attention/ForwardContext 使用 ------
+
+
+
+
+
+            ################################################################################################
+            # 构建两层 slot mapping：按 KV 组与按层名，供 attention/ForwardContext 使用
+            ################################################################################################
             slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
                 num_tokens_padded=num_tokens_padded
                 if pad_attn or has_separate_kv_update
@@ -4978,7 +5036,19 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
             )
 
-            # ------【核心逻辑】构建 attention 元数据（含投机解码公共元数据），为前向做好准备 ------
+
+
+
+
+
+
+
+
+
+
+            ########################################################################
+            # 构建 attention 元数据（含投机解码公共元数据），为前向做好准备 
+            ########################################################################
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
@@ -4995,7 +5065,13 @@ class GPUModelRunner(
                 )
             )
 
-            # ------【核心逻辑】统一预处理出模型前向所需的全部输入（ids/embeds/positions/中间张量/kwargs） ------
+
+
+
+
+            ########################################################################
+            # 统一预处理出模型前向所需的全部输入（ids/embeds/positions/中间张量/kwargs）
+            ########################################################################
             (
                 input_ids,
                 inputs_embeds,
@@ -5007,6 +5083,14 @@ class GPUModelRunner(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
 
+
+
+
+
+
+
+
+
         # Encoder-decoder models can only compile the pure decode steps where no
         # encoder inputs are present. Use eager for the first pass.
         # ------【CUDA Graph】encoder-decoder 带编码器输入时无法走编译图，标记用 eager 前向 ------
@@ -5014,6 +5098,16 @@ class GPUModelRunner(
         has_encoder_input = (
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
+
+
+
+
+
+
+
+
+
+
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -5048,6 +5142,11 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+
+
+            ################################################################################################
+            # 正式开始我们的前向推理
+            ################################################################################################
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -5055,6 +5154,9 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
+
+
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             # ------【投机解码】EAGLE3 用辅助 hidden states 时拆出主/辅两份输出 ------
@@ -6765,7 +6867,7 @@ class GPUModelRunner(
         else:
             # 这里才是我们的逻辑
             ########################################################
-            # 指定dummy batch的参数
+            # 1. 指定dummy batch的参数
             ########################################################
             num_reqs = min(num_tokens, max_num_reqs) # batch的req数
             min_tokens_per_req = num_tokens // num_reqs # 每个req的平均token预算
@@ -6860,7 +6962,7 @@ class GPUModelRunner(
 
         # ------【核心逻辑】为 dummy 批次生成 slot 映射，用于 KV cache 写入地址 ------
         ########################################################
-        # 创建kvcache槽位，
+        # 2. 创建kvcache槽位，
         # vllm的策略是通过把模型权重算上，然后让激活值达到peak， 
         # 这样就可以计算出我们的kvcache的最大可用容量，所以dummy batch并不需要占满所有的kvcache， 只要把batch的最大token数，req数打满，让激活值最大就行了
         ########################################################
@@ -7041,7 +7143,7 @@ class GPUModelRunner(
                 ),
             ):
                 ########################################################
-                # 这边开始前向推理 dummy batch
+                # 3. 这边开始前向推理 dummy batch
                 ########################################################
                 outputs = self.model(
                     input_ids=input_ids,
@@ -8677,13 +8779,13 @@ class GPUModelRunner(
             # Fallback to the general case
             # Initialize the memory buffer for KV cache
             ############################################################################################
-            # 最通用的分配显存的方法
+            # 1. 最通用的分配显存的方法, 先划分每个layer的tensor
             ############################################################################################
             kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
 
             # Change the memory buffer to the desired shape
             ############################################################################################
-            # 对这些个kv cache tensor， reshape出各自的block的维度，然后添加到kv_caches，这个就是我们的block显存池
+            # 2. 对这些个kv cache tensor， reshape出各自的block的维度，然后添加到kv_caches，这个就是我们的block显存池
             ############################################################################################
             kv_caches = self._reshape_kv_cache_tensors(
                 kv_cache_raw_tensors, kernel_block_sizes
@@ -8699,6 +8801,9 @@ class GPUModelRunner(
             2 if self.model_config.hf_config.model_type == "longcat_flash" else 1
         )
         # ------【核心逻辑】把 KV cache 绑定到各层静态前向上下文 ------
+        ################################################
+        # 3. 把划分好的tensor，绑定到model_runner
+        ################################################
         bind_kv_cache(
             kv_caches,
             self.compilation_config.static_forward_context,
@@ -8810,7 +8915,7 @@ class GPUModelRunner(
 
         # ------【内存池/CuMem】分配并 reshape 出最终 KV cache 张量 ------
         ############################################################################################
-        # 划分不同group的各layer的kvcache tensor区域
+        # 1. 划分不同group的各layer的kvcache tensor区域
         ############################################################################################
         kv_caches = self.initialize_kv_cache_tensors(
             kv_cache_config, kernel_block_sizes

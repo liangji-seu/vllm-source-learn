@@ -770,7 +770,9 @@ class EngineCore:
 
 
 
-    # 引擎实际的step 方法
+    ####################################################################################################
+    # 引擎的真正工作循环
+    ####################################################################################################
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -788,14 +790,28 @@ class EngineCore:
         # 调度器调度一次
         # 执行器执行一个step
 
+
+
+
+
+
+
+
         # ------ 连续批处理调度：选取请求 + 分配 KV cache 块（核心逻辑） ------
+        ####################################################################################################
         # 1. 调度器调度：选取请求 + 分配KVcache
+        ####################################################################################################
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
 
 
 
-        # 2. 执行器执行：GPU前向推理, 返回异步RPC的future
+
+
+        
         # ------【异步 RPC】非阻塞提交 GPU 前向，返回 Future，与采样/下一步调度流水重叠 ------
+        ####################################################################################################
+        # 2. 执行器执行：GPU前向推理, 返回异步RPC的future
+        ####################################################################################################
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         # ------【结构化输出/grammar】取语法 bitmask，约束采样 token 符合 schema ------
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output) # 获取语法模版
@@ -806,19 +822,44 @@ class EngineCore:
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
         ):
-            # ------ 阻塞等待 Future 结果；未采样则在此处采样（logits→token） ------
+            
+            ####################################################################################################
+            # 3. ------ 阻塞等待 Future 结果；未采样则在此处采样（logits→token） ------
+            ####################################################################################################
             model_output = future.result() # 阻塞等待本轮调度的结果
             # 因为model runner返回的是未采样的logits这个分布状态，被存放到self.execute_model_state, 所以返回是空的
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+
+
+
+
+
+
+
+
+
+
+
 
         # ------ 处理执行期间到达的中止请求 ------
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
 
+
+
+
+
+
+
+
+
+
         # ------ 用模型输出回填调度器状态（完成/计数/前缀缓存命中） ------
-        # 3. 根据执行器结果，更新调度器的计数状态
+        ####################################################################################################
+        # 4. 根据执行器结果，更新调度器的计数状态
+        ####################################################################################################
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
@@ -827,6 +868,16 @@ class EngineCore:
 
         # 4. 返回结果
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+
+
+
+
+
+
+
+
+
+
 
 
 

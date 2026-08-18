@@ -441,6 +441,17 @@ class Qwen2Model(nn.Module, EagleModelMixin):
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
+
+
+
+
+
+
+
+
+
+
+
 '''
 Qwen2ForCausalLM   (最外层入口，唯一注册)
   └── Qwen2Model      整个主干 = embed_tokens + N × DecoderLayer

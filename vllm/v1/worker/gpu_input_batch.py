@@ -43,19 +43,19 @@ class CachedRequestState:
     num_computed_tokens: int
     output_token_ids: list[int]
 
-    mrope_positions: torch.Tensor | None = None
-    mrope_position_delta: int | None = None
+    mrope_positions: torch.Tensor | None = None # M-RoPE 多模态位置（Qwen2-VL 等），3D 位置编码，每 token 一个
+    mrope_position_delta: int | None = None# M-RoPE 的位置偏移量（图像 token 插入导致后续位置偏移）
 
-    xdrope_positions: torch.Tensor | None = None
+    xdrope_positions: torch.Tensor | None = None # XD-RoPE 位置（HunYuan-VL 等），扩展维度的 RoPE
 
-    lora_request: LoRARequest | None = None
-    prompt_embeds: torch.Tensor | None = None
+    lora_request: LoRARequest | None = None # 该请求挂的 LoRA 适配器，None = 不用 LoRA
+    prompt_embeds: torch.Tensor | None = None # 以 embedding 形式给 prompt（不是 token id），多模态/embedding 输入用
     # To accumulate prompt logprobs tensor chunks across prefill steps.
-    in_progress_prompt_logprobs_cpu: LogprobsTensors | None = None
+    in_progress_prompt_logprobs_cpu: LogprobsTensors | None = None # 分块 prefill 时，累积 prompt 的 logprobs 块（一次 prefill 可能分多步）
 
     # Per-position mask for mixed-mode inputs (e.g chat completion with
     # prompt_embeds content parts). See `Request.prompt_is_token_ids`.
-    prompt_is_token_ids: list[bool] | None = None
+    prompt_is_token_ids: list[bool] | None = None # 混合输入掩码：每个位置是 token id 还是 embed（chat 里混 embedding 时用）
 
     # Used when both async_scheduling and spec_decode are enabled.
     prev_num_draft_len: int = 0
@@ -89,6 +89,19 @@ class CachedRequestState:
         return -1
 
 
+'''
+max_num_reqs            一个batch的最大req数量
+max_model_len           每个req的最大kvcache的上下文窗口长度
+max_num_batched_tokens  一个batch的最大tokens?
+device                  设备
+vocab_size              词表大小
+block_sizes : list[int] 每个kvcache group的block_size, [16(group0), 16(group1),.....]
+kernel_block_sizes      ?
+max_num_blocks_per_req : list[int]   每个req的kvcache的最大blocks数量？
+
+num_spec_tokens         投机解码数量，一个batch的？
+'''
+
 class InputBatch:
     def __init__(
         self,
@@ -100,7 +113,7 @@ class InputBatch:
         block_sizes: list[int],  # The block_size of each kv cache group
         kernel_block_sizes: list[int],
         max_num_blocks_per_req: list[int],
-        logitsprocs: LogitsProcessors | None = None,
+        logitsprocs: LogitsProcessors | None = None,# 打分处理器
         logitsprocs_need_output_token_ids: bool = False,
         num_spec_tokens: int = 0,
         is_pooling_model: bool = False,

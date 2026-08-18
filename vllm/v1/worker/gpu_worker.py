@@ -708,7 +708,7 @@ class Worker(WorkerBase):
         # 之前没有指定过线程，我们自己profiling
         # 这里是上下文管理器，用来记录这个期间的profiling的输出结果
         ################################################################################################################
-        # worker开始指挥 model_runner 进行 profile 测试
+        # 1. worker开始指挥 model_runner 进行 profile 测试
         ################################################################################################################
         with memory_profiling(
             self.init_snapshot, # 内存拍照实例
@@ -761,7 +761,7 @@ class Worker(WorkerBase):
         )
         # ------【显存 profiling】可给 KV cache 的显存 = 预算 - 非 KV 占用 - CUDA graph 池估算 ------
         ################################################################################################################
-        # 计算kvccache可用显存
+        # 2. 计算kvccache可用显存
         ################################################################################################################
         self.available_kv_cache_memory_bytes = (
             self.requested_memory
@@ -912,7 +912,7 @@ class Worker(WorkerBase):
         # Update local config with adjusted num blocks after profiling,
         # so that it's available to the warmup stage.
         ############################################################################################
-        # 把单层可用的block数更新上去
+        # 1. 更新num_gpu_blocks, 把单层可用的block数更新上去, 这里仅仅只是根据一个block_size个token的所有层的blocks的大小除出来的
         ############################################################################################
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks 
 
@@ -926,7 +926,7 @@ class Worker(WorkerBase):
 
         # ------【显存 profiling】在 KV cache 内存池上下文中真正分配 KV cache 张量 ------
         ############################################################################################
-        # 开始正式通知model_runner来初始化显存，把他全部占用，申请成tensor
+        # 2. 开始正式通知model_runner来初始化显存，把他全部占用，申请成tensor
         ############################################################################################
         with self._maybe_get_memory_pool_context(tag="kv_cache"):
             self.model_runner.initialize_kv_cache(kv_cache_config)
@@ -1342,6 +1342,16 @@ class Worker(WorkerBase):
         # ------【结构化输出/grammar】采样委托给 model_runner，grammar bitmask 在此约束 token 选择 ------
         return self.model_runner.sample_tokens(grammar_output)
 
+
+
+
+
+
+
+
+    ################################################################################################
+    # 开始执行一次调度任务batch
+    ################################################################################################
     @torch.inference_mode()
     @with_gpu_sync_check
     def execute_model(
@@ -1354,13 +1364,24 @@ class Worker(WorkerBase):
                 handle.wait()
             self._pp_send_work = []
 
+
+
+
+
         # ------【核心逻辑】读取本轮是否有待调度 token，并初始化中间张量/通信变量 ------
+        ########################################################################
+        # 1. 读取一些相关调度任务信息
+        ########################################################################
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         all_gather_tensors = {}
         compilation_config = self.vllm_config.compilation_config
         parallel_config = self.vllm_config.parallel_config
+
+
+
+
 
         # ------【PP + TP】PP>1 且开启序列并行(SP)时，预先算出残差是否需要 all-gather ------
         if (
@@ -1409,9 +1430,17 @@ class Worker(WorkerBase):
 
         # ------【CUDA Graph】带 profiling 注解调用 model_runner 前向（内部含 CUDA graph 回放 / eager 两种路径）──
         with self.annotate_profile(scheduler_output):
+            ########################################################################
+            # 2. 开始让model runner来执行这个batch, worker这里主要负责分布式的一些处理
+            ########################################################################
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )
+
+
+
+
+
             # ------【核心逻辑】V2 pooling 模型在 output 为空时补跑 pool；得到最终输出就直接返回 ------
             if (
                 self.use_v2_model_runner
@@ -1441,6 +1470,23 @@ class Worker(WorkerBase):
         )
 
         return None
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         # ------【投机解码】取回 draft 模型的草稿 token ids ------
