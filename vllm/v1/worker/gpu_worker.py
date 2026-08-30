@@ -192,6 +192,9 @@ class Worker(WorkerBase):
         self.use_v2_model_runner = vllm_config.use_v2_model_runner # 使用v2的modelrunner
         # ------【PP + 异步 RPC】记录上一轮未完成的非阻塞 PP send 句柄，下轮执行前先等它完成 ------
         # pending non-blocking PP send work from the previous iteration
+        '''
+        这里发送的是batch A 发送句柄，但是为什么是list, 因为发送多个张量，每个张量一个handle
+        '''
         self._pp_send_work: list[Handle] = []
 
         # ------【显存 profiling】睡眠模式后端懒加载，首次 sleep/wake 时才解析并缓存进程级状态 ------
@@ -1340,6 +1343,9 @@ class Worker(WorkerBase):
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         # ------【结构化输出/grammar】采样委托给 model_runner，grammar bitmask 在此约束 token 选择 ------
+        #############
+        # 采样就很直接了，worker直接调用model_runner
+        #############
         return self.model_runner.sample_tokens(grammar_output)
 
 
@@ -1359,6 +1365,8 @@ class Worker(WorkerBase):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         # ------【PP + 异步 RPC】等上一轮非阻塞 PP send 完成，避免与新迭代的通信重叠冲突 ------
         # ensure any previous non-blocking PP sends are complete
+
+        # 先要等上一个batch发送完成（不然这一回的batch会用到它的输出显存）
         if self._pp_send_work:
             for handle in self._pp_send_work:
                 handle.wait()
@@ -1383,7 +1391,7 @@ class Worker(WorkerBase):
 
 
 
-        # ------【PP + TP】PP>1 且开启序列并行(SP)时，预先算出残差是否需要 all-gather ------
+        # ------【PP + TP】PP>1 且开启序列并行(SP)时，预先算出残差是否需要 all-gather (拼接)------
         if (
             parallel_config.pipeline_parallel_size > 1
             and compilation_config.pass_config.enable_sp
@@ -1413,7 +1421,11 @@ class Worker(WorkerBase):
                 )
             }
 
+
+
+
         # ------【PP + 异步 RPC】非首个 PP 阶段：从上游非阻塞接收中间张量，包装成惰性同步对象 ------
+        # 非首个rank， 惰性同步
         if forward_pass and not get_pp_group().is_first_rank:
             tensor_dict, comm_handles, comm_postprocess = (
                 get_pp_group().irecv_tensor_dict(
@@ -1422,6 +1434,7 @@ class Worker(WorkerBase):
                 )
             )
             assert tensor_dict is not None
+            # 包装成惰性pp输入中间张量
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
                 comm_handles=comm_handles,
@@ -1432,6 +1445,9 @@ class Worker(WorkerBase):
         with self.annotate_profile(scheduler_output):
             ########################################################################
             # 2. 开始让model runner来执行这个batch, worker这里主要负责分布式的一些处理
+            # 这里分两种：
+            # 1. 首rank
+            # 2. 非首rank
             ########################################################################
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
@@ -1448,11 +1464,26 @@ class Worker(WorkerBase):
                 and output is None
             ):
                 output = self.model_runner.pool()  # type: ignore
+
+
+            '''
+            model_runner v2 的 model_runner
+            1. 非尾rank, 返回中间张量
+            2. 尾rank, 返回None
+            '''
+            ##############
+            # 当前是尾rank的输出None, 直接结束，可以让这个rank开始下一个sample的任务
+            ##############
             if isinstance(
                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
             ):
                 return output
 
+
+
+        ################ 
+        # 非尾rank， 需要非阻塞向main_stream里面挂一个p2p发送任务
+        ################
         # ------【PP】确认输出是中间张量、且本进程既非 external_launcher 也非末级 PP rank ------
         assert isinstance(output, IntermediateTensors)
         parallel_config = self.vllm_config.parallel_config
@@ -1463,12 +1494,16 @@ class Worker(WorkerBase):
 
         # ------【PP + 异步 RPC】非末级 PP 阶段：非阻塞把中间张量发给下游，句柄留待下轮等待 ------
         # launch non-blocking send of intermediate tensors
+        ########################
+        # 异步发送句柄保留，非阻塞。main_stream
+        ########################
         self._pp_send_work = get_pp_group().isend_tensor_dict(
             output.tensors,
             all_gather_group=get_tp_group(),
             all_gather_tensors=all_gather_tensors,
         )
 
+        # 无论是尾rank，还是非尾rank， worker的execute_model都返回none
         return None
 
 

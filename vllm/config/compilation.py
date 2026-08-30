@@ -413,6 +413,9 @@ class CompilationConfig:
         - [`custom_ops`][vllm.config.CompilationConfig.custom_ops]
         - [`splitting_ops`][vllm.config.CompilationConfig.splitting_ops]
         - [`compile_mm_encoder`][vllm.config.CompilationConfig.compile_mm_encoder]
+
+
+        
     - CudaGraph capture:
         - [`cudagraph_mode`][vllm.config.CompilationConfig.cudagraph_mode]
         - [`cudagraph_capture_sizes`]
@@ -776,6 +779,14 @@ class CompilationConfig:
         "vllm::deepseek_v4_attention",
         "vllm::hpc_rope_norm_forward",
     ]
+
+
+
+
+
+
+
+
 
     def compute_hash(self) -> str:
         """

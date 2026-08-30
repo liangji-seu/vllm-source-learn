@@ -1390,13 +1390,18 @@ class WorkerProc:
         if (response_mq := self.worker_response_mq) is not None:
             response_mq.enqueue(result) # 同步调度，直接往我们的Worker的回复队列里面塞就行了
 
+
+    ###############
+    # 所以这个handle_output是分发结果用的。
+    ###############
     def handle_output(self, output: Any):
         """Handles output from the worker. If async scheduling is enabled,
         it is passed to the async_output_busy_loop thread. Otherwise, it is
         enqueued directly to the worker_response_mq.
         """
         # ------【异步 RPC】按调度模式分流输出：异步入队交给拷贝线程，同步直接写响应队列 ------
-        if self.use_async_scheduling:
+        if self.use_async_scheduling: # PP + step_with_batch_queue + v2, 我们是异步调度
+            # 分发结果
             self.async_output_queue.put(output)
         else:# 我们使用同步调度
             self.enqueue_output(output)
@@ -1429,6 +1434,12 @@ class WorkerProc:
         while True:
             # ------【异步 RPC】阻塞 dequeue 广播指令：拿到要执行的 method 与目标结果 rank ------
             # 持续从广播队列里面接受指令
+            #########################
+            # 即便是在异步调度下，也是从指令广播队列里面，一次执行一个指令,这个队列里面是：
+
+            # (forward A, sample A, forward B, sample B, ....., forward Z, sample Z)
+
+            #########################
             method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(
                 indefinite=True
             )
@@ -1439,10 +1450,17 @@ class WorkerProc:
                 elif isinstance(method, bytes):
                     func = partial(cloudpickle.loads(method), self.worker)
 
+                #########################
+                # 执行完的结果的返回是output，可能是前向，也可能是采样的结果
+                #########################
                 output = func(*args, **kwargs) # 执行方法
 
+                # 如果当前的rank是尾rank
                 if output_rank is None or self.rank == output_rank:
                     self.handle_output(output) # 处理func的结果
+
+
+
             # ------【异步 RPC】异常转失败响应：把不可序列化的异常转成字符串回传给 executor ------
             except Exception as e:
                 # Notes have been introduced in python 3.11

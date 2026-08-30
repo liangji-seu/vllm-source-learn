@@ -34,9 +34,10 @@ class CudagraphDispatcher:
     def __init__(self, vllm_config: VllmConfig):
         self.vllm_config = vllm_config
         self.compilation_config = vllm_config.compilation_config
-        self.uniform_decode_query_len = 1 + self.vllm_config.num_speculative_tokens
+        self.uniform_decode_query_len = 1 + self.vllm_config.num_speculative_tokens # 均匀解码的q长度
 
         # Dict to store valid cudagraph dispatching keys.
+        # 保存一些用于调度匹配的键值
         self.cudagraph_keys: dict[CUDAGraphMode, set[BatchDescriptor]] = {
             CUDAGraphMode.PIECEWISE: set(),
             CUDAGraphMode.FULL: set(),
@@ -60,6 +61,7 @@ class CudagraphDispatcher:
             f"splitting_ops={self.compilation_config.splitting_ops}"
         )
 
+        # 是否初始化完
         self.keys_initialized = False
         self.specialize_lora_count = (
             self.vllm_config.lora_config.specialize_active_lora
@@ -163,6 +165,8 @@ class CudagraphDispatcher:
         )
         self.cudagraph_keys[runtime_mode].add(batch_descriptor)
 
+
+# 初始化调度器的键匹配库，用来匹配合适的档位(mode, key)
     def initialize_cudagraph_keys(
         self, cudagraph_mode: CUDAGraphMode, uniform_decode_query_len: int = 1
     ):
@@ -200,6 +204,8 @@ class CudagraphDispatcher:
                 # because FA3's scheduler_metadata computation depends on it.
                 if cudagraph_mode.mixed_mode() == CUDAGraphMode.PIECEWISE:
                     batch_desc = replace(batch_desc, num_reqs=None, uniform=False)
+
+                # （PIECEWISE， keys）
                 self.add_cudagraph_key(cudagraph_mode.mixed_mode(), batch_desc)
 
         # if decode cudagraph mode is FULL, and we don't already have mixed
@@ -223,6 +229,8 @@ class CudagraphDispatcher:
             for bs, num_active_loras in product(
                 cudagraph_capture_sizes_for_decode, lora_cases
             ):
+
+                # （FULL， keys）
                 self.add_cudagraph_key(
                     CUDAGraphMode.FULL,
                     self._create_padded_batch_descriptor(
@@ -232,6 +240,7 @@ class CudagraphDispatcher:
 
         self.keys_initialized = True
 
+# 调度匹配
     def dispatch(
         self,
         num_tokens: int,

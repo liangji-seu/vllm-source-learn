@@ -182,9 +182,9 @@ class CUDAGraphWrapper:
         runtime_mode: CUDAGraphMode,
         cudagraph_options: CUDAGraphOptions | None = None,
     ) -> None:
-        self.runnable = runnable
+        self.runnable = runnable # model
         self.vllm_config = vllm_config
-        self.runtime_mode = runtime_mode
+        self.runtime_mode = runtime_mode # mode 一次前向的时候就知道自己这次是FULL还是PIECEWISE了
         self.compilation_config = vllm_config.compilation_config
 
         self.first_run_finished = False
@@ -204,6 +204,8 @@ class CUDAGraphWrapper:
         self.cudagraph_options = cudagraph_options
         # the entries for different batch descriptors that we need to capture
         # cudagraphs for.
+
+        # 存放已经捕获的graph
         self.concrete_cudagraph_entries: dict[BatchDescriptor, CUDAGraphEntry] = {}
 
         CUDAGraphWrapper._all_instances.add(self)
@@ -230,6 +232,9 @@ class CUDAGraphWrapper:
     def clear_graphs(self) -> None:
         self.concrete_cudagraph_entries.clear()
 
+
+
+    # 包装后的前向推理
     def __call__(self, *args: Any, **kwargs: Any) -> Any | None:
         if not is_forward_context_available():
             # No forward context means we are outside the normal
@@ -237,10 +242,14 @@ class CUDAGraphWrapper:
             # Just run the underlying function without cudagraphs.
             return self.runnable(*args, **kwargs)
 
-        forward_context = get_forward_context()
-        batch_descriptor = forward_context.batch_descriptor
-        cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode
 
+        # 获取前向上下文，得到 （mode, key）
+        forward_context = get_forward_context()
+        batch_descriptor = forward_context.batch_descriptor # key
+        cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode # mode
+
+
+        # 不用cuda graph
         if (
             cudagraph_runtime_mode == CUDAGraphMode.NONE
             or cudagraph_runtime_mode != self.runtime_mode
@@ -253,15 +262,22 @@ class CUDAGraphWrapper:
             # runtime modes.
             return self.runnable(*args, **kwargs)
 
+
+
+
         assert batch_descriptor is not None
+
+        # 如果这个key，不在调度器预设且已经主动捕获的里面，惰性捕获
         if batch_descriptor not in self.concrete_cudagraph_entries:
             # create a new entry for this batch descriptor
+            # 创建一个新的图放进去，然后开始capture
             self.concrete_cudagraph_entries[batch_descriptor] = CUDAGraphEntry(
                 batch_descriptor=batch_descriptor
             )
 
         entry = self.concrete_cudagraph_entries[batch_descriptor]
 
+        # 如果这个还没有录制图
         if entry.cudagraph is None:
             if self.cudagraph_options.debug_log_enable:
                 # Since we capture cudagraph for many different shapes and
@@ -279,6 +295,8 @@ class CUDAGraphWrapper:
             input_addresses = [
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)
             ]
+
+            # 记录下图的输入地址
             entry.input_addresses = input_addresses
             cudagraph = torch.cuda.CUDAGraph()
 
@@ -310,12 +328,18 @@ class CUDAGraphWrapper:
                 get_offloader().sync_prev_onload()
 
                 # mind-exploding: carefully manage the reference and memory.
+                ############################# 
+                # 开始录制
+                # wrapper的录制代码，对FULL，PIECEWISE完全相同
+                # 
+                #############################
                 with torch.cuda.graph(
                     cudagraph,
                     pool=self.graph_pool,
                     stream=current_stream(),
                 ):
                     # `output` is managed by pytorch's cudagraph pool
+                    # 前向执行
                     output = self.runnable(*args, **kwargs)
                     # Join offloader's copy stream after forward to avoid
                     # unjoined stream error. The last layer's start_prefetch
@@ -333,6 +357,7 @@ class CUDAGraphWrapper:
 
             # here we always use weak ref for the output
             # to save memory
+            # 保存图 + 输出地址
             entry.output = weak_ref_tensors(output)
             entry.cudagraph = cudagraph
 
@@ -357,5 +382,8 @@ class CUDAGraphWrapper:
         # Sync offloader before replay - ensures any external dependencies
         # from pre-capture prefetches are satisfied.
         get_offloader().sync_prev_onload()
+
+
+        # 这个录制过图了，直接重放即可
         entry.cudagraph.replay()
         return entry.output

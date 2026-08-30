@@ -1402,8 +1402,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     @torch.inference_mode()
     def execute_model(
         self,
-        scheduler_output: SchedulerOutput,
-        intermediate_tensors: IntermediateTensors | None = None,
+        scheduler_output: SchedulerOutput, # 调度器输入batch
+        intermediate_tensors: IntermediateTensors | None = None, # pp中前面rank处理后输出发送过来的中间张量
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
@@ -1579,11 +1579,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             "input_ids": input_ids,
             "positions": input_batch.positions,
             "inputs_embeds": inputs_embeds,
-            "intermediate_tensors": None,
+            "intermediate_tensors": None, # 这个是首个rank的模型输入，所以标记不是中间张量
             # NOTE: Values returned by `prepare_inputs` will override the default
             # values above.
             **self.model_state.prepare_inputs(input_batch, self.req_states),
         }
+
+
+
+
+
+
+
+
+
+        '''
+        如果是非首个rank, 那么模型的输入model_inputs就把他清除掉，直接用中间张量
+        '''
         # ------【PP】非首 PP rank 不读原始输入，改为接收上一级传来的中间张量 ------
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.
@@ -1607,6 +1619,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # ------【EP/EPLB】前向前更新专家并行的负载均衡元数据 ------
         # Update the EPLB meta.
         self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
+
+
+
+
+
+
+
+
+
+
+
 
         # ------【CUDA Graph】FULL 模式直接回放整张计算图 ------
         # Run model.
@@ -1666,6 +1689,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert isinstance(model_output, IntermediateTensors)
             hidden_states = None
             aux_hidden_states = None
+            # 非尾rank， hidden_state, 直接返回我们的中间状态
             output_intermediate_tensors = model_output
 
         routed_experts = None
@@ -1675,22 +1699,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             routed_experts = capturer.get_routed_experts(slot_mappings, num_toks)
 
         finished_req_ids = scheduler_output.finished_req_ids
+
+
+
         # ------【核心逻辑】把本步中间产物打包，供后续 sample_tokens/pool 阶段使用 ------
+        ###################
+        # 尾rank, 就构造model_runner v2 的 execute_model的输出返回的状态
+        ###################
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
             attn_metadata=attn_metadata,
             slot_mappings_by_layer=slot_mappings_by_layer,
-            hidden_states=hidden_states,
-            aux_hidden_states=aux_hidden_states,
+            hidden_states=hidden_states, # 这是我们的尾rank的hidden_state
+            aux_hidden_states=aux_hidden_states, # 这是非尾rank的中间状态输出
             finished_req_ids=finished_req_ids,
             routed_experts=routed_experts,
         )
 
         # ------【PP】非末级 rank 返回中间张量以便传给下一级 ------
+        #####################
+        # 非尾rank，返回中间张量
+        #####################
         if not self.is_last_pp_rank:
             # Non-last PP rank: return IntermediateTensors for sending.
             return output_intermediate_tensors
+
+
+        #######################
+        # 尾rank， 返回None
+        #######################
         return None
+
+
+
+
+
+
+
+
+
 
     @torch.inference_mode()
     @step_eplb_after()
@@ -1698,6 +1745,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self, grammar_output: GrammarOutput | None
     ) -> AsyncOutput | ModelRunnerOutput | None:
         # ------【核心逻辑】execute_model 未成功产出状态则直接返回 ------
+        '''
+        self.execute_model_state， 尾rank会设置他的model_runner的这个属性
+        '''
+        # 当前rank的这个状态没有设置，所以是非尾rank，不采样直接return
         if self.execute_model_state is None:
             # The prior execute_model call must have failed.
             return None
@@ -1858,6 +1909,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         model_runner_output.kv_connector_output = kv_connector_output
 
         return async_output
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         # ------【投机解码】取出当前草稿 token id 供调度器/scheduler 使用 ------

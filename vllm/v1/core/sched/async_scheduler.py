@@ -17,28 +17,39 @@ class AsyncScheduler(Scheduler):
         self.pp_size = self.parallel_config.pipeline_parallel_size
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        # 同步调度器的更新（无placeholder）
         super()._update_after_schedule(scheduler_output)
+
+
+
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
         # Use the latest num of scheduled draft tokens in next step as placeholder.
+
+        # 准备出多少个占位，表示在途的token数
         self._spec_token_placeholders = [
             -1
-        ] * scheduler_output.num_spec_tokens_to_schedule
+        ] * scheduler_output.num_spec_tokens_to_schedule 
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
             if request.is_prefill_chunk:
                 continue
 
+            # 判断是否有冲突， 需要bitmask更新，且此时这个req的占位>0, 表示上一个batch还没回传采样 token id
             scheduler_output.pending_structured_output_tokens |= (
                 request.use_structured_output and request.num_output_placeholders > 0
             )
+
             # The request will generate num_sampled_tokens_per_step new tokens
             # plus num_spec_tokens in this scheduling step. Diffusion has no AR
             # bonus token (num_sampled_tokens_per_step == 0) — only the canvas
             # (spec) tokens.
             cur_num_spec_tokens = len(spec_decode_tokens.get(req_id, ()))
-            request.num_output_placeholders += (
+            request.num_output_placeholders += ( # 占位数还有再加上投机解码的数量
                 self.num_sampled_tokens_per_step + cur_num_spec_tokens
             )
+
+
+
             # Add placeholders for the new draft/spec tokens.
             # We will update the actual spec token ids in the worker process.
             request.spec_token_ids = self._spec_token_placeholders
@@ -46,6 +57,9 @@ class AsyncScheduler(Scheduler):
             if self.use_v2_model_runner:
                 # Set the next step index in which this request is eligible to be
                 # scheduled for decode (for PP microbatching).
+                ##################
+                # 只有在model_runner v2的时候，才会启用decode节流，这个时候Scheduler里面的节流逻辑判断条件才会生效
+                ##################
                 request.next_decode_eligible_step = self.current_step + self.pp_size
 
     def _update_request_with_output(

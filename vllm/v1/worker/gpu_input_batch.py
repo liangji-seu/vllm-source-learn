@@ -43,6 +43,9 @@ class CachedRequestState:
     num_computed_tokens: int
     output_token_ids: list[int]
 
+
+
+
     mrope_positions: torch.Tensor | None = None # M-RoPE 多模态位置（Qwen2-VL 等），3D 位置编码，每 token 一个
     mrope_position_delta: int | None = None# M-RoPE 的位置偏移量（图像 token 插入导致后续位置偏移）
 
@@ -320,8 +323,8 @@ class InputBatch:
         self.pooling_states: dict[str, PoolingStates] = {}
 
         # Cached reference to the GPU tensor of previously sampled tokens
-        self.prev_sampled_token_ids: torch.Tensor | None = None
-        self.prev_req_id_to_index: dict[str, int] | None = None
+        self.prev_sampled_token_ids: torch.Tensor | None = None # 上一轮采样输出的token，每个req一个
+        self.prev_req_id_to_index: dict[str, int] | None = None # 上一轮的req的下标集合
         # These are used to update output_token_ids with real sampled
         # ids from prior step, if required by current sampling params
         # (e.g. penalties).

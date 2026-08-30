@@ -347,6 +347,9 @@ class EngineCore:
         # ------【PP】选择主循环：有批处理队列走 step_with_batch_queue，否则走 step ------
         # 选择引擎的主循环用哪个函数
         self.step_fn = (
+            ####################
+            # 【PP优化】，如果我们设计了batch queue, 那么就可以异步多次提交然后，改善pp并行的bubble
+            ####################
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
@@ -897,6 +900,10 @@ class EngineCore:
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
 
+
+    ###############
+    # 【PP】在有batch queue的情况的优化
+    ###############
     def step_with_batch_queue(
         self,
     ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
@@ -915,59 +922,127 @@ class EngineCore:
         """
 
         # ------【PP】批队列主循环：异步调度/执行多批消除气泡；此处校验队列存在且未满 ------
+        ######## 由引擎后端Enginecore持有这个batch queue
         batch_queue = self.batch_queue
+
+
+
+
         assert batch_queue is not None
 
         # Try to schedule a new batch if the batch queue is not full, but
         # the scheduler may return an empty batch if all requests are scheduled.
         # Note that this is not blocking.
-        assert len(batch_queue) < self.batch_queue_size
+        assert len(batch_queue) < self.batch_queue_size # 队列还没满
 
+
+
+
+
+        # 局部变量置零
         model_executed = False
         deferred_scheduler_output = None
+
+
+
+
+
         # ------ 有请求即调度一批（非阻塞）；否则走下方「等待已有批次结果」分支 ------
+        # 如果调度器还有请求，就产生本次的scheduleroutput, 也就是调度输出（一个新的batch）
         if self.scheduler.has_requests():
+
+            # 现在得到本次的batch
+            ##############################
+            # 1. 得到本次的调度任务batchN
+            ##############################
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+
             # ------【异步 RPC】非阻塞提交 GPU 前向，返回 Future 供后续消费 ------
+            # 异步发送给worker
             with self.log_error_detail(scheduler_output):
+                ##############################
+                # 2. 异步发送 batchN的前向 RPC
+                ##############################
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
-            # ------【核心逻辑】EC 消费者按「是否真调了 token」判定本步是否执行前向 ------
-            if self.is_ec_consumer:
-                model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
-            # ------【结构化输出/grammar】pooling/空批免采样；否则取 bitmask 立即采样，缺 token 则延迟 ------
+
+
+
+
+            # ------【核心逻辑】编码器缓存（PD分离） 消费者按「是否真调了 token」判定本步是否执行前向 ------
+            if self.is_ec_consumer:# 普通的直接就是true
+                model_executed = scheduler_output.total_num_scheduled_tokens > 0 
+                # model_executed = True 表示本步batch不是空批
+
+            # ------ pooling/空批免采样；否则取 bitmask 立即采样，缺 token 则延迟 ------
             if self.is_pooling_model or not model_executed:
                 # No sampling required (no requests scheduled).
+                # 是pooling模型，或则本轮是空批，进这里
                 future = cast(Future[ModelRunnerOutput], exec_future)
             else:
+                # 默认走这里
+                # 不是pooling模型，且不是空批，有计算
                 if not scheduler_output.pending_structured_output_tokens:
                     # We aren't waiting for any tokens, get any grammar output
                     # and sample immediately.
+                    #############################
+                    # 本轮batchN，需要batchN-1的token id从GPU侧回传来更新bitmask更新。
+                    # 进入这里，说明是False, 表示不pending等待，说明前一轮的batchN-1的token已经回传更新bitmask了，本轮batchN的bitmask已经是最新的了
+                    #############################
+
+                    # 开始更新所有req的bitmask表
                     grammar_output = self.scheduler.get_grammar_bitmask(
                         scheduler_output
                     )
+                    
+                    
+                    ##############################
+                    # 3. 异步发送一个采样 RPC
+                    ##############################
                     future = self.model_executor.sample_tokens(
                         grammar_output, non_block=True
                     )
+
+
+
                 # ------ 缺上一轮 token，暂存 scheduler_output，待前向结果回来后再采样 ------
                 else:
+                    #############################
+                    # 进入这里，表示当前batchN不能发送采样RPC，因为bitmask没有更新，因为batchN-1的token id还没被回传，
+                    # 就先把这个batch保存下来， 这个batchN 延迟采样
+                    #############################
                     # We need to defer sampling until we have processed the model output
                     # from the prior step.
                     deferred_scheduler_output = scheduler_output
 
-            # ------【PP】未延迟采样则入队；队列未满且仍有活时直接返回，优先填满队列而非取结果 ------
+
+
             if not deferred_scheduler_output:
+                #############################
+                # batchN没有延迟采样，说明batchN的采样RPC已经发出
+                # 保存好这个batch的本次任务，都是异步的，(采样RPC的异步结果， batchN内容， 前向RPC的异步结果)
+                #############################
                 # Add this step's future to the queue.
                 batch_queue.appendleft((future, scheduler_output, exec_future))
+
+
+                # batch_queue还没满，batchN还是真批，调度器还有req要调度
                 if len(batch_queue) < self.batch_queue_size and (
                     model_executed or self.scheduler.has_requests()
                 ):
                     # Don't block on next worker response unless the queue is full
                     # or there are no more requests to schedule.
+                    # 不阻塞，继续循环执行step， 返回值没用
                     return None, model_executed
 
+
+
+
+        #############################
+        # 调度器队列空，且队列空，说明没有req，直接返回，空循环
+        #############################
         # ------ 调度器无请求且队列空：无活可干，返回空结果 ------
         elif not batch_queue:
             # Queue is empty. We should not reach here since this method should
@@ -975,33 +1050,67 @@ class EngineCore:
             # is non-empty.
             return None, False
 
+
+
+        #############################
+        # 调度器队列空，且batch_queue已经满了(不满会在if里面就被加入batch_queue然后直接返回)
+        # 所以只能卡着等返回
+        #############################
         # Block until the next result is available.
         # ------ 阻塞等待队首批次完成，取出其 Future 结果与对应调度输出 ------
+        
+        #############################
+        # 先把最老的batch future弹出来，他应该最先完成，我们的调度出去的任务必须按顺序完成
+        #############################
         future, scheduler_output, exec_model_fut = batch_queue.pop()
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
         ):
+            #############################
+            # 阻塞，等待采样RPC结果返回
+            #############################
             model_output = future.result()
             if model_output is None:
+                ################
+                # 发现采样RPC返回结果是空，说明执行出问题了。异常抛出
+                ################
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
 
+
+        '''
+        enginecore 进程，其实不关心模型的前向RPC输出logits，这个就留在GPU里面，所以只需要采样RPC的返回结果是token id就行
+        '''
+
+
+
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         # ------ 先处理执行期中止请求，再用模型输出回填调度器并附迭代统计 ------
         self._process_aborts_queue()
+
+
+        # 开始根据结果核销
         engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
+            scheduler_output, model_output # （batchN, 采样RPC输出）
         )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
+
+
+
+
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
         # re-called. The latter slightly favors TTFT over TPOT/throughput.
         # ------【投机解码 + 结构化输出/grammar】补做延迟采样：先校验 draft token 再取 bitmask 采样入队 ------
+        ################################
+        # 补做 batchN的延迟采样
+        ################################
+
         if deferred_scheduler_output:
             # When draft tokens are used with structured output, validate them
             # before computing the grammar bitmask for the deferred request.
@@ -1014,15 +1123,39 @@ class EngineCore:
                     self.scheduler.update_draft_token_ids_in_output(
                         draft_token_ids, deferred_scheduler_output
                     )
+
+
+
+            
             # We now have the tokens needed to compute the bitmask for the
             # deferred request. Get the bitmask and call sample tokens.
+            # batchN-1的token id已经传回来了，可以更新bitmask了
             grammar_output = self.scheduler.get_grammar_bitmask(
                 deferred_scheduler_output
             )
+
+            ####################
+            # 重新补发batchN的采样RPC
+            ####################
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
 
         return engine_core_outputs, model_executed
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     def _process_aborts_queue(self):
         # ------【核心逻辑】把执行期间积压的中止请求一次性批量 abort，摊薄中止开销 ------

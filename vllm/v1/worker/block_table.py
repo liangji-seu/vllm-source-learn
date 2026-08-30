@@ -179,6 +179,10 @@ class BlockTable:
         self.num_blocks_per_row[src_tgt] = self.num_blocks_per_row[tgt_src]
         self.block_table.np[src_tgt] = self.block_table.np[tgt_src]
 
+
+    ####################################
+    # 计算槽位
+    ####################################
     def compute_slot_mapping(
         self,
         num_reqs: int,
@@ -192,6 +196,10 @@ class BlockTable:
             return
         assert self.slot_mapping_mode == SlotMappingMode.TOKEN_TO_KV_SLOT
 
+
+        ############
+        # 1. 调用后端kernel来计算。
+        ############
         _compute_slot_mapping_kernel[(num_reqs + 1,)](
             num_tokens,
             self.max_num_batched_tokens,
